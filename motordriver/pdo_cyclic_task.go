@@ -662,6 +662,10 @@ func StartPDOCyclic(devices []*MasterDevice) error {
 						case d.IsPosEnabled():
 							// Profile Position (Mode 1)
 							goal := d.desiredTargetPosition.Load()
+							command := d.ppRelativeCommand.Load()
+							if command != nil {
+								goal = command.Value
+							}
 							C.write_s8(d.DomainPD, d.OffOpMode, C.int8_t(1))
 							C.write_s32(d.DomainPD, d.OffTargetPos, C.int32_t(goal))
 							C.write_s32(d.DomainPD, d.OffTargetVel, C.int32_t(0))
@@ -676,6 +680,9 @@ func StartPDOCyclic(devices []*MasterDevice) error {
 							// sequence. We do not queue or replace targets while another PP move
 							// is in progress; the executor waits for each move to finish.
 							base := uint16(0x000F)
+							if command != nil {
+								base |= 0x0040 // keep relative type throughout this command
+							}
 							if d.ppSetpointPending.Load() {
 								// Profile Position set-point handshake (CiA-402 §9.4.2):
 								//

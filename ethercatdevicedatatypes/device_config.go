@@ -15,6 +15,9 @@ type Device struct {
 	IOPollingInterval int     `yaml:"io-poll-interval"`
 	DriveType         string  `yaml:"drive-type"`
 
+	ContinuousRotation    bool `yaml:"continuous-rotation"`
+	MotorTurnsPerTableRev int  `yaml:"motor-turns-per-table-rev"`
+
 	// RPMConst and DriveXRatio are NOT read from device-configuration.yml.
 	// They are injected at runtime by auto-discovery from the drive YAML
 	// motion: section. Do not add yaml tags here — values set in YAML will

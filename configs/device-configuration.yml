@@ -13,3 +13,5 @@ devices:
       pot-not-threshold: 1.5
       stop-when-hardware-potnot: true
       io-poll-interval: 10000
+      continuous-rotation: true
+      motor-turns-per-table-rev: 120

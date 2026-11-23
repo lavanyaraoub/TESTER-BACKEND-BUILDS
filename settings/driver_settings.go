@@ -51,7 +51,8 @@ type DriverSettings struct {
 	HomingDriveXRatio int   `json:"homing_drive_x_ratio,omitempty"`
 	// A separate validity flag is required because encoder count 0 is a valid
 	// home position immediately after a multiturn reset.
-	HomingValid bool `json:"homing_valid,omitempty"`
+	HomingValid    bool   `json:"homing_valid,omitempty"`
+	HomingGeometry string `json:"homing_geometry,omitempty"`
 }
 
 type BinaryPosFeed struct {
@@ -413,6 +414,8 @@ func SaveHomingReference(driveName string, apos int32) error {
 // SaveHomingCalibration atomically persists the encoder origin captured after
 // multiturn reset and the derived fixed machine-zero pulse target.
 func SaveHomingCalibration(driveName string, encoderZeroApos, homingApos int32, driveXRatio ...int) error {
+	settingsMutex.Lock()
+	defer settingsMutex.Unlock()
 	path := helper.AppendWDPath("/settings/settings.json")
 	raw, err := ioutil.ReadFile(path)
 	if err != nil {
@@ -448,7 +451,17 @@ func SaveHomingCalibration(driveName string, encoderZeroApos, homingApos int32, 
 	}
 	rootRaw[driveName] = json.RawMessage(newDriveBlob)
 
-	settingsMutex.Lock()
+	out, err := json.MarshalIndent(rootRaw, "", "\t")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
 	if settingsRoot == nil {
 		settingsRoot = make(SettingsRoot)
 	}
@@ -460,17 +473,8 @@ func SaveHomingCalibration(driveName string, encoderZeroApos, homingApos int32, 
 	}
 	existing.HomingValid = true
 	settingsRoot[driveName] = existing
-	settingsMutex.Unlock()
 
-	out, err := json.MarshalIndent(rootRaw, "", "\t")
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return nil
 }
 
 // GetDriverSettings returns the settings for one drive by name.

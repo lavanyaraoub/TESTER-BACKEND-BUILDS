@@ -318,6 +318,11 @@ func InitMaster() error {
 			reverseDir(masterDevice)
 		}
 
+		if err := configureContinuousAxis(masterDevice); err != nil {
+			statusnotifier.Alarm(err.Error())
+			return err
+		}
+
 		statusnotifier.DriverStatus(i.Name, "1")
 		time.Sleep(500 * time.Millisecond)
 		PowerOn(masterDevice)

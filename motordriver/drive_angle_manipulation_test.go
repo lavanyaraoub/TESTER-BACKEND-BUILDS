@@ -78,7 +78,7 @@ func almostEqual(a, b float64) bool {
 
 func TestCalculateFixedAbsoluteGoal_IndependentOfStartingResidual(t *testing.T) {
 	const home = int32(1_000_000)
-	injectDriverSettings("A", settings.DriverSettings{HomingApos: home})
+	injectDriverSettings("A", settings.DriverSettings{HomingApos: home, HomingValid: true})
 	dev := makeDevice(20_000)
 
 	dev.PDOPos.Store(home + 20*20_000 + 9)
@@ -94,8 +94,8 @@ func TestCalculateFixedAbsoluteGoal_IndependentOfStartingResidual(t *testing.T) 
 	}
 
 	want := home + 300*20_000
-	if goal1 != want || goal2 != want {
-		t.Fatalf("goals = %d and %d, want identical fixed target %d", goal1, goal2, want)
+	if goal1.Position != want || goal2.Position != want {
+		t.Fatalf("goals = %d and %d, want identical fixed target %d", goal1.Position, goal2.Position, want)
 	}
 }
 
@@ -104,7 +104,7 @@ func TestCalculateFixedAbsoluteGoal_CWAndCCWSelectEquivalentRevolutions(t *testi
 		home  = int32(1_000_000)
 		ratio = int32(20_000)
 	)
-	injectDriverSettings("A", settings.DriverSettings{HomingApos: home})
+	injectDriverSettings("A", settings.DriverSettings{HomingApos: home, HomingValid: true})
 	dev := makeDevice(int(ratio))
 	dev.PDOPos.Store(home + 20*ratio)
 
@@ -112,8 +112,8 @@ func TestCalculateFixedAbsoluteGoal_CWAndCCWSelectEquivalentRevolutions(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := home + 300*ratio; cwGoal != want {
-		t.Fatalf("CW goal = %d, want %d", cwGoal, want)
+	if want := home + 300*ratio; cwGoal.Position != want {
+		t.Fatalf("CW goal = %d, want %d", cwGoal.Position, want)
 	}
 
 	ccwGoal, err := calculateFixedAbsoluteGoal(dev, 300, -80, 0, 0.003)
@@ -123,8 +123,8 @@ func TestCalculateFixedAbsoluteGoal_CWAndCCWSelectEquivalentRevolutions(t *testi
 	// 300 degrees on the previous revolution, shifted -0.003 degrees
 	// for the configured CCW backlash compensation.
 	wantCCW := int64(home) + int64(math.Round((300.0-0.003)*float64(ratio))) - 360*int64(ratio)
-	if int64(ccwGoal) != wantCCW {
-		t.Fatalf("CCW goal = %d, want %d", ccwGoal, wantCCW)
+	if int64(ccwGoal.Position) != wantCCW {
+		t.Fatalf("CCW goal = %d, want %d", ccwGoal.Position, wantCCW)
 	}
 }
 
@@ -133,7 +133,7 @@ func TestCalculateFixedAbsoluteGoal_CrossingZeroUsesNextRevolution(t *testing.T)
 		home  = int32(1_000_000)
 		ratio = int32(20_000)
 	)
-	injectDriverSettings("A", settings.DriverSettings{HomingApos: home})
+	injectDriverSettings("A", settings.DriverSettings{HomingApos: home, HomingValid: true})
 	dev := makeDevice(int(ratio))
 	dev.PDOPos.Store(home + 350*ratio)
 
@@ -142,14 +142,14 @@ func TestCalculateFixedAbsoluteGoal_CrossingZeroUsesNextRevolution(t *testing.T)
 		t.Fatal(err)
 	}
 	want := int64(home) + 10*int64(ratio) + 360*int64(ratio)
-	if int64(goal) != want {
-		t.Fatalf("350->10 CW goal = %d, want next-revolution target %d", goal, want)
+	if int64(goal.Position) != want {
+		t.Fatalf("350->10 CW goal = %d, want next-revolution target %d", goal.Position, want)
 	}
 }
 
 func TestCalculateFixedAbsoluteGoal_AppliesAposCorrection(t *testing.T) {
 	const home = int32(1_000_000)
-	injectDriverSettings("A", settings.DriverSettings{HomingApos: home})
+	injectDriverSettings("A", settings.DriverSettings{HomingApos: home, HomingValid: true})
 	dev := makeDevice(20_000)
 	dev.AposCorrection.Store(1234)
 	dev.PDOPos.Store(home + 1234)
@@ -159,8 +159,8 @@ func TestCalculateFixedAbsoluteGoal_AppliesAposCorrection(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := home + 1234 + 90*20_000
-	if goal != want {
-		t.Fatalf("goal with APOS correction = %d, want %d", goal, want)
+	if goal.Position != want {
+		t.Fatalf("goal with APOS correction = %d, want %d", goal.Position, want)
 	}
 }
 

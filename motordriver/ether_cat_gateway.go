@@ -129,6 +129,9 @@ type MasterDevice struct {
 	// desiredMTFunc/desiredMTStart removed: multiturn reset uses async SDO requests,
 	// not per-cycle PDO writes. See triggerMultiTurnReset() in reset.go.
 	desiredOpMode         atomic.Int32 // S8 stored in low bits
+	continuousPeriod      int64        // immutable after startup validation; zero for ordinary axes
+	homingGeometry        string
+	ppRelativeCommand     atomic.Pointer[PPCommand]
 	desiredTargetPosition atomic.Int32
 	currentTargetPosition atomic.Int32
 	ppSetpointPending     atomic.Bool // one-shot pulse for Profile Position new set-point (bit4)
@@ -374,6 +377,9 @@ func (d *MasterDevice) SetTargetVelocityPDO(targetVelocity int32) error {
 // Arms the one-shot set-point pulse when enabling.
 func (d *MasterDevice) EnablePosPDO(enabled bool) {
 	d.pdoPosEnabled.Store(enabled)
+	if !enabled {
+		d.ppRelativeCommand.Store(nil)
+	}
 	if enabled {
 		d.pdoJogEnabled.Store(false)
 		// arm one-shot set-point pulse for Profile Position mode (opmode 1)
@@ -386,6 +392,7 @@ func (d *MasterDevice) SetTargetPositionPDO(targetPosition int32) error {
 	if !d.PdoPosReady {
 		return fmt.Errorf("SetTargetPositionPDO: PdoPosReady=false — RxPDO not configured")
 	}
+	d.ppRelativeCommand.Store(nil) // absolute targets and holds must never inherit relative mode
 	d.desiredTargetPosition.Store(targetPosition)
 	// ensure next cyclic tick triggers a new set-point pulse (PP mode)
 	d.ppSetpointPending.Store(true)

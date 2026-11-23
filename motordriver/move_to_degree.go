@@ -152,7 +152,7 @@ func moveMotorToDegree(device *MasterDevice, degreeToRotate float64) error {
 	// ABS fast-path: already at target, no motion needed
 	// ----------------------------------------------------------
 	alreadyAtAbsoluteTarget := false
-	var stationaryAbsoluteGoal int32
+	var stationaryAbsoluteGoal MotionTarget
 	if driverStatusAfterECS.mode == "ABS" {
 		activeBacklash := positiveBacklashMagnitude(driverStatusAfterECS.backlash)
 		stationaryPitch := getPitchError(device.Name, destination)
@@ -165,7 +165,7 @@ func moveMotorToDegree(device *MasterDevice, degreeToRotate float64) error {
 			activeBacklash,
 		)
 		if stationaryErr == nil {
-			stationaryResidual := int64(stationaryAbsoluteGoal) - int64(device.PDOPos.Load())
+			stationaryResidual := positionResidual(device, stationaryAbsoluteGoal.Position, device.PDOPos.Load())
 			if stationaryResidual < 0 {
 				stationaryResidual = -stationaryResidual
 			}
@@ -182,7 +182,7 @@ func moveMotorToDegree(device *MasterDevice, degreeToRotate float64) error {
 	if alreadyAtAbsoluteTarget {
 
 		// Double-check the raw PDO count immediately before declaring completion.
-		recheckResidual := int64(stationaryAbsoluteGoal) - int64(device.PDOPos.Load())
+		recheckResidual := positionResidual(device, stationaryAbsoluteGoal.Position, device.PDOPos.Load())
 		if recheckResidual < 0 {
 			recheckResidual = -recheckResidual
 		}
@@ -367,7 +367,7 @@ func stepMode(masterDevice *MasterDevice, valueInDegreeToAdd float64) error {
 // ----------------------------------------------------------
 
 type movementDirectionPlan struct {
-	direction         int
+	direction        int
 	previousBacklash float64
 	nextBacklash     float64
 	reversed         bool
@@ -469,11 +469,11 @@ func positionForMotionPlanning(
 // absolute program move (including A0) and Zero Reference.
 //
 // It deliberately owns the complete sequence:
-//   1. register the actual movement direction,
-//   2. let the direction state machine decide whether this is a reversal,
-//   3. read the resulting one-time backlash compensation,
-//   4. apply pitch correction, and
-//   5. build one fixed encoder target from HomingApos + AposCorrection.
+//  1. register the actual movement direction,
+//  2. let the direction state machine decide whether this is a reversal,
+//  3. read the resulting one-time backlash compensation,
+//  4. apply pitch correction, and
+//  5. build one fixed encoder target from HomingApos + AposCorrection.
 //
 // Keeping this in one helper prevents A0 and Zero Ref from silently using
 // different compensation rules again.
@@ -482,9 +482,9 @@ func prepareFixedAbsoluteGoal(
 	driverStatus driverCurrentStatus,
 	destination float64,
 	signedPath float64,
-) (goal int32, pitchErr float64, backlash float64, directionPlan movementDirectionPlan, err error) {
+) (goal MotionTarget, pitchErr float64, backlash float64, directionPlan movementDirectionPlan, err error) {
 	if device == nil {
-		return 0, 0, 0, movementDirectionPlan{}, errors.New("prepareFixedAbsoluteGoal: nil device")
+		return MotionTarget{}, 0, 0, movementDirectionPlan{}, errors.New("prepareFixedAbsoluteGoal: nil device")
 	}
 
 	directionPlan = planMovementDirection(driverStatus, signedPath)
@@ -499,7 +499,7 @@ func prepareFixedAbsoluteGoal(
 		backlash,
 	)
 	if err != nil {
-		return 0, pitchErr, backlash, directionPlan, err
+		return MotionTarget{}, pitchErr, backlash, directionPlan, err
 	}
 
 	logger.Info("[POSITION-COMP ABS] previousDirection=", driverStatus.direction,
@@ -584,4 +584,3 @@ func ReadActualPositionFromDrive(driveName string) float64 {
 	// Last resort: return cached value
 	return getCurrentDriverStatus(driveName).currentPosition
 }
-

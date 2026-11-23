@@ -1,6 +1,6 @@
 {
 	"A": {
-		"back_lash": "0.004",
+		"back_lash": "0",
 		"binary_pos_feed": [
 			{
 				"binary": "1110",
@@ -96,7 +96,7 @@
 		"cl_dl": 0,
 		"cldl_timing": "3000",
 		"ecs": 0,
-		"encoder_zero_apos": 34339,
+		"encoder_zero_apos": 35489,
 		"fin_signal": 1,
 		"g54": "3.14",
 		"g55": 0,
@@ -106,9 +106,10 @@
 		"g59": 0,
 		"gear_ratio": "1:90",
 		"home_dir": 1,
-		"homing_apos": 34339,
+		"homing_apos": 35489,
 		"homing_done": true,
 		"homing_drive_x_ratio": 20000,
+		"homing_geometry": "a6b-mode4:20000:{Mode:4 Upper:119 Feed:60000 FeedTurns:1 MotorTurns:1 ShaftTurns:1 Encoder:8388608 EncoderTurns:1 Minimum:0 Maximum:7199999 Offset:0 RelativeOption:2 Polarity:0 LimitMin:0 LimitMax:0}",
 		"homing_offset": "0",
 		"homing_valid": true,
 		"jog_feed": "3",

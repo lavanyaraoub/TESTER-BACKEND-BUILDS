@@ -86,10 +86,10 @@ func moveToZero(device *MasterDevice) error {
 	fixedHome := int64(envSettings.HomingApos) + int64(device.AposCorrection.Load())
 	revolution := nearestIntegerQuotient(currentPulse-fixedHome, countsPerRevolution)
 	uncompensatedGoal64 := fixedHome + revolution*countsPerRevolution
-	if uncompensatedGoal64 < int64(-1<<31) || uncompensatedGoal64 > int64(1<<31-1) {
-		return fmt.Errorf("zero-reference target overflow for %s: %d", device.Name, uncompensatedGoal64)
+	uncompensatedTarget, targetErr := makeMotionTarget(uncompensatedGoal64, int32(currentPulse), motionPeriod(device))
+	if targetErr != nil {
+		return targetErr
 	}
-	uncompensatedTarget := int32(uncompensatedGoal64)
 
 	// If the previous command already used backlash compensation, the physical
 	// zero can intentionally sit away from raw HomingApos. Build the no-motion
@@ -113,7 +113,7 @@ func moveToZero(device *MasterDevice) error {
 	if stationaryGoalErr != nil {
 		return stationaryGoalErr
 	}
-	residual := int64(targetPulse) - currentPulse
+	residual := positionResidual(device, targetPulse.Position, device.PDOPos.Load())
 	if residual < 0 {
 		residual = -residual
 	}
@@ -177,7 +177,7 @@ func moveToZero(device *MasterDevice) error {
 		return goalErr
 	}
 	targetPulse = compensatedGoal
-	compensatedResidual := int64(targetPulse) - currentPulse
+	compensatedResidual := positionResidual(device, targetPulse.Position, device.PDOPos.Load())
 	if compensatedResidual < 0 {
 		compensatedResidual = -compensatedResidual
 	}

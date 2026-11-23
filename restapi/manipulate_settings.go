@@ -98,7 +98,7 @@ func manipulateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	errWrite := ioutil.WriteFile(helper.AppendWDPath("/settings/settings.json"), toWriteJSON, 0777)
+	errWrite := settings.WriteSettingsPreservingHoming(toWriteJSON)
 	if errWrite != nil {
 		logger.Error("settings write failed:", errWrite)
 		_ = json.NewEncoder(w).Encode(SettingsResponse{

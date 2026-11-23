@@ -295,7 +295,7 @@ func captureStableEncoderPosition(device *MasterDevice) (int32, error) {
 	for time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 		current := int64(device.PDOPos.Load())
-		drift := current - previous
+		drift := positionResidual(device, int32(current), int32(previous))
 		if drift < 0 {
 			drift = -drift
 		}
@@ -317,8 +317,18 @@ func homingAposFromOffset(device *MasterDevice, encoderOrigin int32) (int32, err
 		return 0, fmt.Errorf("invalid drive_x_ratio")
 	}
 	ds := settings.GetDriverSettings(device.Name)
-	offsetPulses := int64(math.Round(float64(ds.HomingOffset) * float64(device.Device.DriveXRatio)))
+	offset := float64(ds.HomingOffset)
+	if math.IsNaN(offset) || math.IsInf(offset, 0) {
+		return 0, fmt.Errorf("invalid Home Offset")
+	}
+	if motionPeriod(device) > 0 {
+		offset = math.Mod(offset, 360)
+	}
+	offsetPulses := int64(math.Round(offset * float64(device.Device.DriveXRatio)))
 	home := int64(encoderOrigin) + offsetPulses
+	if period := motionPeriod(device); period > 0 {
+		return int32(wrapRotary(home, period)), nil
+	}
 	if home < int64(-1<<31) || home > int64(1<<31-1) {
 		return 0, fmt.Errorf("home pulse target overflow: origin=%d offset=%d", encoderOrigin, offsetPulses)
 	}
@@ -337,6 +347,9 @@ func captureAndSaveHomingCalibration(device *MasterDevice) (int32, int32, error)
 	if err := settings.SaveHomingCalibration(device.Name, encoderOrigin, machineHome, device.Device.DriveXRatio); err != nil {
 		return 0, 0, err
 	}
+	if err := settings.SaveHomingGeometry(device.Name, device.homingGeometry); err != nil {
+		return 0, 0, err
+	}
 	device.AposCorrection.Store(0)
 	return encoderOrigin, machineHome, nil
 }
@@ -348,6 +361,13 @@ func recalculateCalibratedHomes() {
 	for _, device := range getMasterDevices() {
 		ds := settings.GetDriverSettings(device.Name)
 		if !ds.HomingValid {
+			continue
+		}
+		if err := checkSavedHomeGeometry(device); err != nil {
+			logger.Error("[HOME-CAL] geometry check failed: ", err)
+			continue
+		}
+		if !settings.GetDriverSettings(device.Name).HomingValid {
 			continue
 		}
 		machineHome, err := homingAposFromOffset(device, ds.EncoderZeroApos)

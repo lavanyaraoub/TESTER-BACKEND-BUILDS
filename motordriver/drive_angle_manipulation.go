@@ -28,6 +28,11 @@ func InitAposCorrection(driveName string) {
 		logger.Warn("InitAposCorrection: device not found:", driveName)
 		return
 	}
+	if dev.Device.ContinuousRotation {
+		dev.AposCorrection.Store(0)
+		return
+	}
+
 	ds := settings.GetDriverSettings(driveName)
 	if !ds.HomingValid {
 		dev.AposCorrection.Store(0)
@@ -99,8 +104,9 @@ func nearestIntegerQuotient(numerator, denominator int64) int64 {
 // the calibrated count assigned to the destination.
 //
 // signedPath is the existing path planner's result:
-//   positive = the currently configured CW direction
-//   negative = the currently configured CCW direction
+//
+//	positive = the currently configured CW direction
+//	negative = the currently configured CCW direction
 //
 // directionalBacklash must already be zero for CW or the configured positive
 // backlash magnitude for CCW. The same compensation is included in both the
@@ -111,33 +117,43 @@ func calculateFixedAbsoluteGoal(
 	signedPath float64,
 	pitchError float64,
 	directionalBacklash float64,
-) (int32, error) {
+) (MotionTarget, error) {
 	if masterDevice == nil {
-		return 0, fmt.Errorf("calculateFixedAbsoluteGoal: nil device")
+		return MotionTarget{}, fmt.Errorf("calculateFixedAbsoluteGoal: nil device")
 	}
 	if math.IsNaN(destination) || math.IsInf(destination, 0) ||
 		math.IsNaN(signedPath) || math.IsInf(signedPath, 0) ||
 		math.IsNaN(pitchError) || math.IsInf(pitchError, 0) ||
 		math.IsNaN(directionalBacklash) || math.IsInf(directionalBacklash, 0) {
-		return 0, fmt.Errorf("calculateFixedAbsoluteGoal: non-finite motion value")
+		return MotionTarget{}, fmt.Errorf("calculateFixedAbsoluteGoal: non-finite motion value")
 	}
 
 	driverSettings := settings.GetDriverSettings(masterDevice.Name)
 	if !driverSettings.HomingValid {
-		return 0, fmt.Errorf("absolute positioning requires a valid home calibration for %s; perform multiturn reset and apply Home Offset", masterDevice.Name)
+		return MotionTarget{}, fmt.Errorf("absolute positioning requires a valid home calibration for %s; perform multiturn reset and apply Home Offset", masterDevice.Name)
 	}
 
 	ratio := int64(masterDevice.Device.DriveXRatio)
 	if ratio <= 0 {
-		return 0, fmt.Errorf("absolute positioning requires a positive drive_x_ratio for %s", masterDevice.Name)
+		return MotionTarget{}, fmt.Errorf("absolute positioning requires a positive drive_x_ratio for %s", masterDevice.Name)
+	}
+	if masterDevice.Device.ContinuousRotation && (motionPeriod(masterDevice) <= 0 ||
+		driverSettings.HomingDriveXRatio != int(ratio) || driverSettings.HomingGeometry != masterDevice.homingGeometry) {
+		return MotionTarget{}, fmt.Errorf("continuous absolute positioning requires matching drive geometry and home calibration")
 	}
 	countsPerRevolution := int64(360) * ratio
 
 	currentRaw := int64(masterDevice.PDOPos.Load())
 	homeRaw := int64(driverSettings.HomingApos) + int64(masterDevice.AposCorrection.Load())
+	if period := motionPeriod(masterDevice); period > 0 {
+		homeRaw = wrapRotary(homeRaw, period)
+	}
 
 	compensatedDestination := destination + pitchError - directionalBacklash
 	canonicalTarget := homeRaw + int64(math.Round(compensatedDestination*float64(ratio)))
+	if period := motionPeriod(masterDevice); period > 0 {
+		canonicalTarget = wrapRotary(canonicalTarget, period)
+	}
 
 	// Preserve the old path planner's CW/CCW decision. This approximate goal
 	// identifies the desired encoder revolution only; it is never sent to the
@@ -150,15 +166,9 @@ func calculateFixedAbsoluteGoal(
 	)
 	absoluteGoal := canonicalTarget + revolution*countsPerRevolution
 
-	const (
-		minInt32Target = int64(-1 << 31)
-		maxInt32Target = int64(1<<31 - 1)
-	)
-	if absoluteGoal < minInt32Target || absoluteGoal > maxInt32Target {
-		return 0, fmt.Errorf(
-			"absolute target overflow for %s: goal=%d allowed=[%d,%d]",
-			masterDevice.Name, absoluteGoal, minInt32Target, maxInt32Target,
-		)
+	target, err := makeMotionTarget(absoluteGoal, int32(currentRaw), motionPeriod(masterDevice))
+	if err != nil {
+		return MotionTarget{}, err
 	}
 
 	logger.Info("[ABS-POS] drive=", masterDevice.Name,
@@ -173,7 +183,7 @@ func calculateFixedAbsoluteGoal(
 		" goal=", absoluteGoal,
 		" delta=", absoluteGoal-currentRaw)
 
-	return int32(absoluteGoal), nil
+	return target, nil
 }
 
 /*
