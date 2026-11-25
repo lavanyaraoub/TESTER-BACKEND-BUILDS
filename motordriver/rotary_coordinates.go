@@ -1,6 +1,9 @@
 package motordriver
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // MotionTarget separates a fixed destination from a relative wire command.
 // Delta includes intentional full turns; Position is the expected wrapped end.
@@ -16,6 +19,11 @@ type MotionTarget struct {
 type PPCommand struct {
 	Value    int32 // 607A payload: a distance, not the expected end position
 	Expected int32
+	// Reference is the actual position used when this command was prepared.
+	// The cyclic task rebases a fixed endpoint again just before bit4 rises.
+	Reference    int32
+	LateBound    bool
+	DistanceOnly bool // G91 retains its distance; G90 retains its destination
 }
 
 func wrapRotary(value, period int64) int64 {
@@ -72,7 +80,7 @@ func (target MotionTarget) relativeCommand(actual int32, distanceOnly bool) (PPC
 	if delta < -1<<31 || delta > 1<<31-1 {
 		return PPCommand{}, fmt.Errorf("relative distance %d exceeds int32; split the move", delta)
 	}
-	return PPCommand{Value: int32(delta), Expected: expected}, nil
+	return PPCommand{Value: int32(delta), Expected: expected, Reference: actual, LateBound: true, DistanceOnly: distanceOnly}, nil
 }
 
 // ContinuousGeometry is read before activation. No live SDO parameter writes
@@ -98,4 +106,168 @@ func (g ContinuousGeometry) validate(ratio, motorTurnsPerTableRev int) (int64, s
 	// The fingerprint deliberately excludes the current position. A changed
 	// drive scaling, period, polarity or offset invalidates the saved home.
 	return period, fmt.Sprintf("a6b-mode4:%d:%+v", ratio, g), nil
+}
+
+// Position spread used to distinguish settled feedback from merely passing
+// through the application's acceptance band. No drive parameter is written.
+const (
+	positionStabilityPulses = int64(5)
+	positionLatchQuietTime  = 10 * time.Millisecond
+	positionLatchMaxGap     = 3 * time.Millisecond
+)
+
+type positionStability struct {
+	started, last    time.Time
+	anchor           int32
+	minimum, maximum int64
+}
+
+func (s *positionStability) reset() { *s = positionStability{} }
+
+// observe uses wrapped differences so a rotary rollover cannot look like a
+// large jump. A scheduling gap is not evidence of continuously quiet feedback.
+func (s *positionStability) observe(actual int32, period int64, now time.Time, window, maxGap time.Duration) bool {
+	if s.started.IsZero() || now.Sub(s.last) > maxGap {
+		*s = positionStability{started: now, last: now, anchor: actual}
+		return false
+	}
+	delta := int64(actual) - int64(s.anchor)
+	if period > 0 {
+		delta = rotaryDifference(int64(actual), int64(s.anchor), period)
+	}
+	if delta < s.minimum {
+		s.minimum = delta
+	}
+	if delta > s.maximum {
+		s.maximum = delta
+	}
+	if s.maximum-s.minimum > positionStabilityPulses {
+		*s = positionStability{started: now, last: now, anchor: actual}
+		return false
+	}
+	s.last = now
+	return now.Sub(s.started) >= window
+}
+
+// atLatch preserves intentional full turns. Only small coordinate drift is
+// wrapped; the requested distance itself is never reduced modulo one turn.
+func (command PPCommand) atLatch(actual int32, period int64) (PPCommand, error) {
+	if period < 2 || period > 1<<31-1 || actual < 0 || int64(actual) >= period ||
+		command.Reference < 0 || int64(command.Reference) >= period ||
+		command.Expected < 0 || int64(command.Expected) >= period {
+		return PPCommand{}, fmt.Errorf("invalid relative latch coordinate: reference=%d actual=%d expected=%d period=%d", command.Reference, actual, command.Expected, period)
+	}
+	if !command.LateBound {
+		return command, nil
+	}
+	if !command.DistanceOnly && int32(wrapRotary(int64(command.Reference)+int64(command.Value), period)) != command.Expected {
+		return PPCommand{}, fmt.Errorf("inconsistent fixed endpoint: reference=%d delta=%d expected=%d", command.Reference, command.Value, command.Expected)
+	}
+	delta := int64(command.Value)
+	expected := command.Expected
+	if command.DistanceOnly {
+		expected = int32(wrapRotary(int64(actual)+delta, period))
+	} else {
+		delta -= rotaryDifference(int64(actual), int64(command.Reference), period)
+	}
+	if delta < -1<<31 || delta > 1<<31-1 {
+		return PPCommand{}, fmt.Errorf("relative distance at latch exceeds int32: %d", delta)
+	}
+	// A late rebase must never introduce an unplanned reversal. Such a
+	// change needs a fresh direction/limit plan rather than an automatic move.
+	if command.Value != 0 && delta != 0 && (command.Value < 0) != (delta < 0) {
+		return PPCommand{}, fmt.Errorf("relative latch would reverse the planned direction: prepared=%d latched=%d", command.Value, delta)
+	}
+	return PPCommand{Value: int32(delta), Expected: expected, Reference: actual, LateBound: command.LateBound, DistanceOnly: command.DistanceOnly}, nil
+}
+
+type ppCommandError struct{ Message string }
+
+type ppLatchRecord struct {
+	PreparedReference, Actual, Value, Expected int32
+	Waited                                     time.Duration
+	TriggeredAt                                time.Time
+}
+
+type ppLatchOutput struct {
+	Command                 PPCommand
+	Controlword             uint16
+	Triggered, Acknowledged bool
+}
+
+// ppRelativeLatch is owned exclusively by one axis of the PDO cyclic task.
+// It stages one payload with bit4 LOW, then freezes it from the rising edge
+// through acknowledgement. No retries, sleeps, logging or SDO calls occur here.
+type ppRelativeLatch struct {
+	source                          *PPCommand
+	quiet                           positionStability
+	firstSeen                       time.Time
+	staged, triggered, acknowledged bool
+	wire                            PPCommand
+}
+
+func (s *ppRelativeLatch) reset() { *s = ppRelativeLatch{} }
+
+// holdOnInvalidFeedback never creates a new edge. Once triggered, retain the
+// HIGH until a valid ACK arrives; before triggering require fresh staging again.
+func (s *ppRelativeLatch) holdOnInvalidFeedback(command *PPCommand) ppLatchOutput {
+	out := ppLatchOutput{Command: *command, Controlword: 0x004F}
+	if s.source == command {
+		out.Command = s.wire
+		if s.triggered && !s.acknowledged {
+			out.Controlword |= 0x0010
+		}
+	}
+	if !s.triggered {
+		s.quiet.reset()
+		s.staged = false
+	}
+	return out
+}
+
+func (s *ppRelativeLatch) step(command *PPCommand, actual int32, status uint16, modeReady bool, period int64, now time.Time) (ppLatchOutput, error) {
+	const base = uint16(0x004F) // Operation Enabled, relative PP, new-setpoint LOW
+	if s.source != command {
+		*s = ppRelativeLatch{source: command, firstSeen: now, wire: *command}
+	}
+	out := ppLatchOutput{Command: s.wire, Controlword: base}
+	if s.triggered {
+		// Preserve exactly the same distance while the drive acknowledges it.
+		if s.acknowledged || status&0x1000 != 0 {
+			s.acknowledged = true
+			out.Acknowledged = true
+		} else {
+			out.Controlword |= 0x0010
+		}
+		return out, nil
+	}
+	// Wait for the previous ACK to fall and Mode 1 to become active.
+	if !modeReady || status&0x1000 != 0 {
+		s.quiet.reset()
+		s.staged = false
+		return out, nil
+	}
+	if !s.quiet.observe(actual, period, now, positionLatchQuietTime, positionLatchMaxGap) {
+		s.staged = false
+		return out, nil
+	}
+	prepared, err := command.atLatch(actual, period)
+	if err != nil {
+		return out, err
+	}
+	if !s.staged || prepared.Value != s.wire.Value || prepared.Expected != s.wire.Expected {
+		// Deliver the freshly computed distance for one PDO frame before
+		// raising bit4. Re-evaluate from fresh feedback on the next frame.
+		s.wire = prepared
+		out.Command = prepared
+		s.staged = true
+		return out, nil
+	}
+	// The same payload was delivered with bit4 LOW in the previous valid
+	// cycle. Preserve its reference/value/expected tuple through ACK.
+	out.Command = s.wire
+	s.triggered = true
+	out.Triggered = true
+	out.Controlword |= 0x0010
+	return out, nil
 }

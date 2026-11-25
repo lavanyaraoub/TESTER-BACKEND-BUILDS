@@ -81,6 +81,13 @@ func moveMotorToDegree(device *MasterDevice, degreeToRotate float64) error {
 	motionMu.Lock()
 	defer motionMu.Unlock()
 
+	// A residual stop remains latched even if feedback later drifts back
+	// inside tolerance. Do not let the already-at-target fast path send FIN.
+	if device.posMoveAborted.Load() || systemResetInProgress.Load() {
+		doneDriverAction()
+		return fmt.Errorf("position move blocked until Reset")
+	}
+
 	driverStatus := getCurrentDriverStatus(device.Device.Name)
 	// FIX: Bypass the asynchronous Go channel cache.
 	// Read true position synchronously from the EtherCAT buffer to prevent skipped lines.
@@ -226,6 +233,11 @@ func moveMotorToDegree(device *MasterDevice, degreeToRotate float64) error {
 					return clampErr
 				}
 			}
+			if err := checkPositionEndpoint(device, stationaryAbsoluteGoal.Position); err != nil {
+				failPositionMove(device, err)
+				doneDriverAction()
+				return err
+			}
 			sendECSFinSignal(device)
 
 			channels.WriteCommandExecInput("waiting_for_ecs", "")
@@ -285,9 +297,9 @@ func moveMotorToDegree(device *MasterDevice, degreeToRotate float64) error {
 		errMsg := fmt.Sprintf("[PDO-PP] move failed: %v", rotErr)
 		logger.Error(errMsg)
 		statusnotifier.Alarm(errMsg)
-		// CRITICAL: call doneDriverAction so the executor does NOT hang forever on
-		// WaitExecuteNextCommand(). Without this, a failed move blocks the program
-		// indefinitely — the user would have to manually click Stop every time.
+		// Release the waiting handler only AFTER publishing the alarm.
+		// command_executor checks it synchronously and stops on this line;
+		// releasing the wait is not a successful motion completion.
 		doneDriverAction()
 		return rotErr
 	}
@@ -297,14 +309,10 @@ func moveMotorToDegree(device *MasterDevice, degreeToRotate float64) error {
 	// A failed or emergency-aborted move therefore cannot poison the next move.
 	commitMovementDirection(device, completedDirection)
 
-	// NOTE: No settle loop here.
-	// hasTargetReached() inside doRotate already confirmed bit10=1 AND bit12=0
-	// stable for 50 consecutive 1ms PDO cycles before returning. Re-polling
-	// position + bit10 again would add up to 20ms of unnecessary latency on
-	// every move with zero safety benefit.
-
+	// runPositionGoal already validated the independent software residual
+	// limit and completed clamping. Drive bit10 need not be high here.
 	if IsPDOActive() && device.PdoPosReady {
-		logger.Info("[PDO-PP] position AND bit10 confirmed, sending finish signal. id:", uid)
+		logger.Info("[PDO-PP] software endpoint and clamp confirmed, sending finish signal. id:", uid)
 	}
 
 	// ----------------------------------------------------------

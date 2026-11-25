@@ -115,6 +115,11 @@ func (d *MasterDevice) SetRelativeMovePDO(command PPCommand) error {
 	if command.Expected < 0 || int64(command.Expected) >= d.continuousPeriod {
 		return fmt.Errorf("axis %s: expected endpoint outside continuous range", d.Name)
 	}
+	// Preserve the caller's immutable reference and distance semantics.
+	// Normal G90/G91 commands opt into late binding in relativeCommand;
+	// legacy explicit PPCommand values keep their existing wire semantics.
+	d.ppPrepareError.Store(nil)
+	d.ppLatchRecord.Store(nil)
 	d.desiredTargetPosition.Store(command.Expected)
 	d.ppRelativeCommand.Store(&command)
 	d.ppSetpointPending.Store(true)

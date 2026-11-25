@@ -11,23 +11,7 @@ import (
 )
 
 const (
-	// The previous 500-count gate could itself exceed the complete indexing
-	// scatter allowance (500 counts = 90 arcsec at 20000 counts/degree).
-	// Ten counts is 1.8 arcsec at 20000 counts/degree and 0.3 arcsec at
-	// 120000 counts/degree.
-	positionPulseTolerance = int32(25)
-
-	// Minimum hold after Target Reached. The settling helper then requires
-	// stable completion within tolerance before PP is disabled.
-	positionSettleTime = 100 * time.Millisecond
-)
-
-// Distinguish a settling deadline from faults, cancellation and lost feedback.
-// Only a genuine settling timeout may enter endpoint correction.
-var errPositionSettleTimeout = errors.New("position settle timeout")
-
-const (
-	positionCorrectionAttempts = 2
+	positionCorrectionAttempts  = 0
 	positionCorrectionMaxPulses = int64(100)
 )
 
@@ -68,6 +52,9 @@ func nonReverseDir(masterDevice *MasterDevice) error {
 // to use the saved Machine Parameters value while the new frontend can supply
 // its live speedometer value for this jog only.
 func ManualJog(masterDevice *MasterDevice, direction int, jogFeedOverride ...float64) error {
+	if masterDevice.posMoveAborted.Load() || systemResetInProgress.Load() {
+		return fmt.Errorf("[JOG] motion blocked until Reset")
+	}
 	driverStatus := getCurrentDriverStatus(masterDevice.Device.Name)
 	if isMotionBlockedByPotNotLimit(driverStatus, direction) {
 		logger.Error("pot/not exceeded, exiting from move command")
@@ -185,167 +172,186 @@ func StopJog(masterDevice *MasterDevice) error {
 	return nil
 }
 
-// hasTargetReached waits for CiA-402 PP completion: sw bit10=1 (Target Reached),
-// stable for stableWindow. Uses statusword bits — not position error — because
-// the drive runs its own ramp.
-//
-// HAL change: the per-drive completion condition (A6 requires bit12=0, Delta does
-// not) is now delegated to masterDevice.Driver.IsTargetReached(sw). The old
-// masterDevice.Device.DriveType string check has been removed.
-func hasTargetReached(masterDevice *MasterDevice) error {
-	// --- PDO path: Profile Position statusword check ---
-	if masterDevice.PdoPosReady && IsPDOActive() {
-		const (
-			bitTargetReached = uint16(1 << 10) // SW bit10: motion complete, motor at target
-			bitFault         = uint16(1 << 3)  // SW bit3:  drive fault
-			moveTimeout      = 30 * time.Second
+// positionFeedbackError keeps faults, stop/reset and stale PDO feedback ahead
+// of every completion decision. An emergency abort is cleared only by Reset.
+func positionFeedbackError(d *MasterDevice) error {
+	return positionFeedbackStateError(d, false)
+}
 
-			// stableWindow: bit10 must stay HIGH continuously this long.
-			// Time-based so single-sample noise glitches cause no latency penalty.
-			stableWindow = 10 * time.Millisecond
-		)
-
-		logger.Trace("[PDO-PP] waiting for Target Reached. goal=",
-			masterDevice.desiredTargetPosition.Load())
-
-		// ----------------------------------------------------------
-		// PHASE 1 — Wait for CiA-402 handshake completion
-		// The cyclic task holds CW bit 4 HIGH until the drive replies
-		// with SW bit 12 HIGH. Once acknowledged, ppSetpointPending
-		// becomes false, and we can safely monitor for completion.
-		// ----------------------------------------------------------
-		handshakeDeadline := time.Now().Add(2 * time.Second)
-		for masterDevice.ppSetpointPending.Load() {
-			sw := uint16(masterDevice.PDOStatus.Load() & 0xFFFF)
-
-			if sw&bitFault != 0 {
-				return fmt.Errorf("[PDO-PP Phase1] drive fault during handshake: sw=0x%04X err=0x%04X",
-					sw, uint16(masterDevice.PDOErr.Load()&0xFFFF))
-			}
-			if !IsPDOActive() {
-				return fmt.Errorf("[PDO-PP Phase1] aborted: PDO cyclic stopped (system reset)")
-			}
-			if time.Now().After(handshakeDeadline) {
-				return fmt.Errorf("[PDO-PP Phase1] handshake timeout: drive did not acknowledge set-point (bit 12)")
-			}
-			time.Sleep(1 * time.Millisecond)
-		}
-
-		logger.Debug("[PDO-PP] drive acknowledged set-point — waiting for bit10 to clear. goal=",
-			masterDevice.desiredTargetPosition.Load(), " actual=", masterDevice.PDOPos.Load())
-
-		// PHASE 1.5 — Wait for bit10 to go LOW (confirms new move started).
-		//
-		// CRITICAL: If bit10 never clears, it means the drive is still reporting
-		// "Target Reached" from the PREVIOUS move. The motor physically never
-		// started. We MUST NOT fall through to Phase 2 in this case — Phase 2
-		// would immediately see bit10=1 (stale) and declare false "target reached",
-		// causing FINISH BLOCKED and hanging the executor.
-		//
-		// If bit10 does not clear within the deadline, return a recoverable error
-		// so the caller (doRotate/moveMotorToDegree) can retry the move.
-		bit10Cleared := false
-		bit10ClearDeadline := time.Now().Add(500 * time.Millisecond)
-		for time.Now().Before(bit10ClearDeadline) {
-			sw := uint16(masterDevice.PDOStatus.Load() & 0xFFFF)
-			if sw&bitFault != 0 {
-				return fmt.Errorf("[PDO-PP Phase1.5] drive fault: sw=0x%04X", sw)
-			}
-			if !IsPDOActive() {
-				return fmt.Errorf("[PDO-PP Phase1.5] aborted: PDO cyclic stopped")
-			}
-			if sw&bitTargetReached == 0 {
-				logger.Debug("[PDO-PP] bit10 cleared — motor moving...")
-				bit10Cleared = true
-				break
-			}
-			time.Sleep(1 * time.Millisecond)
-		}
-
-		// Motor did not start — drive ACKed the set-point but bit10 never went LOW.
-		// This is a recoverable condition: the drive ignored the set-point (possibly
-		// because it was in a transient "already at target" state). Return a specific
-		// error so the caller can re-trigger the set-point and retry.
-		if !bit10Cleared {
-			goal := masterDevice.desiredTargetPosition.Load()
-			actual := masterDevice.PDOPos.Load()
-			residual := positionResidual(masterDevice, goal, actual)
-			return fmt.Errorf("[PDO-PP Phase1.5] motor did not start — drive may have missed set-point. "+
-				"goal=%d actual=%d residualPulses=%d. Retrying recommended.",
-				goal, actual, residual)
-		}
-
-		// ----------------------------------------------------------
-		// PHASE 2 — Wait for bit10 stable for stableWindow
-		//
-		// Use a time-based stability gate: track the wall-clock time
-		// when bit10 first went HIGH. If it stays HIGH for stableWindow
-		// without interruption, the move is complete.
-		//
-		// A glitch (bit10 drops to 0 for 1-2ms due to noise) resets
-		// stableFrom but does NOT add fixed 50ms penalty — recovery is
-		// instant on the next 1ms poll when bit10 returns to 1.
-		// ----------------------------------------------------------
-		timeout := time.Now().Add(moveTimeout)
-		var stableFrom time.Time
-		stableStarted := false
-
-		for {
-			sw := uint16(masterDevice.PDOStatus.Load() & 0xFFFF)
-
-			// Abort immediately on drive fault (bit3)
-			if sw&bitFault != 0 {
-				return fmt.Errorf("[PDO-PP] drive fault during move: sw=0x%04X errCode=0x%04X",
-					sw, uint16(masterDevice.PDOErr.Load()&0xFFFF))
-			}
-
-			// Exit immediately if PDO was shut down
-			if !IsPDOActive() {
-				return fmt.Errorf("[PDO-PP] aborted: PDO cyclic stopped (system reset)")
-			}
-
-			// Exit immediately if emergency cancelled this move.
-			if masterDevice.posMoveAborted.Load() {
-				masterDevice.posMoveAborted.Store(false)
-				return fmt.Errorf("[PDO-PP] aborted: position move cancelled by emergency")
-			}
-
-			// HAL: IsTargetReached is drive-specific.
-			//   A6Minas     → bit10=1 AND bit12=0 (strict Set-Point Ack handshake)
-			//   DeltaASDA2E → bit10=1 only         (bit12 caused 30s hang on Delta)
-			// Uses masterDevice.Driver (per-device) instead of GetMotorDriver() (global)
-			// so that in a mixed-axis setup each axis uses its own completion condition.
-			isTargetReached := masterDevice.Driver.IsTargetReached(sw)
-
-			if isTargetReached {
-				if !stableStarted {
-					stableFrom = time.Now()
-					stableStarted = true
-				} else if time.Since(stableFrom) >= stableWindow {
-					goalPulses := masterDevice.desiredTargetPosition.Load()
-					actualPulses := masterDevice.PDOPos.Load()
-					logger.Trace("[PDO-PP] target reached.",
-						"sw=", fmt.Sprintf("0x%04X", sw),
-						"goal=", goalPulses,
-						"pos=", actualPulses,
-						"residualPulses=", positionResidual(masterDevice, goalPulses, actualPulses))
-					return nil
-				}
-			} else {
-				stableStarted = false // Reset stability timer if it fluctuates
-			}
-
-			if time.Now().After(timeout) {
-				goal := masterDevice.desiredTargetPosition.Load()
-				actual := masterDevice.PDOPos.Load()
-				return fmt.Errorf("[PDO-PP] timeout waiting for Target Reached: sw=0x%04X goal=%d pos=%d residualPulses=%d",
-					sw, goal, actual, positionResidual(masterDevice, goal, actual))
-			}
-			time.Sleep(1 * time.Millisecond)
-		}
+// A confirmed clamp intentionally requests servo-off in the existing brake
+// sequence. Validate faults/cancellation/freshness without rejecting that state.
+func positionFeedbackStateError(d *MasterDevice, clampComplete bool) error {
+	if !IsPDOActive() || !d.PdoPosReady {
+		return fmt.Errorf("[PDO-PP] position feedback unavailable")
 	}
+	if d.posMoveAborted.Load() || systemResetInProgress.Load() || (!clampComplete && !d.IsPosEnabled()) {
+		return fmt.Errorf("[PDO-PP] position move cancelled by stop/reset")
+	}
+	if preparation := d.ppPrepareError.Load(); preparation != nil {
+		return fmt.Errorf("[PDO-PP PREPARE] %s", preparation.Message)
+	}
+	if healthy, age := PDOHealthy(); !healthy {
+		return fmt.Errorf("[PDO-PP] stale PDO heartbeat, age=%s", age)
+	}
+	snapshot, ok := d.ReadPDOFeedback()
+	if !ok {
+		// A reader can overlap the bounded cyclic publication. The caller
+		// retries; heartbeat and move deadlines still bound the wait.
+		return nil
+	}
+	if snapshot.LastValidAt.IsZero() || time.Since(snapshot.LastValidAt) > positionFeedbackMaxAge || time.Now().Before(snapshot.LastValidAt) {
+		return fmt.Errorf("[PDO-PP] stale valid PDO feedback; sample=%d wkc=%d", snapshot.Sequence, snapshot.WorkingCounter)
+	}
+	// Never decide a state transition from an incomplete exchange.
+	if !snapshot.Valid {
+		return nil
+	}
+	sw := snapshot.Status
+	if sw&0x0008 != 0 {
+		return fmt.Errorf("[PDO-PP] drive fault: sw=0x%04X err=0x%04X",
+			sw, snapshot.ErrorCode)
+	}
+	if !clampComplete && sw&0x006F != 0x0027 {
+		return fmt.Errorf("[PDO-PP] drive left Operation Enabled, sw=0x%04X", sw)
+	}
+	return nil
+}
 
-	return fmt.Errorf("hasTargetReached: PDO not active or PdoPosReady=false")
+// hasTargetReached remains a compatibility entry point for existing callers.
+// Production moves use the same single bounded observer directly.
+func hasTargetReached(d *MasterDevice) error {
+	_, _, err := waitForPositionCompletion(d)
+	return err
+}
+
+func waitForPositionCompletion(d *MasterDevice) (int32, int64, error) {
+	const handshakeTimeout = 2 * time.Second
+	started := time.Now()
+	handshakeDeadline := started.Add(handshakeTimeout)
+	var completion *positionCompletion
+	var last PDOFeedbackSnapshot
+	var lastObserverReport time.Time
+	var initialPosition int32
+	haveInitial := false
+	for {
+		if time.Since(started) >= positionMoveTimeout {
+			if completion != nil {
+				return last.Position, 0, completion.failure(last, "move deadline exceeded")
+			}
+			return last.Position, 0, fmt.Errorf("[PDO-PP] timeout waiting for coherent acknowledged feedback")
+		}
+		if err := positionFeedbackError(d); err != nil {
+			return last.Position, 0, err
+		}
+		s, ok := d.ReadPDOFeedback()
+		if !ok {
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		last = s
+		if s.Valid && !haveInitial {
+			initialPosition = s.Position
+			haveInitial = true
+		}
+		now := time.Now()
+		if d.ppSetpointPending.Load() || (s.Valid && s.Status&0x1000 != 0) {
+			deadline := handshakeDeadline
+			if record := d.ppLatchRecord.Load(); record != nil {
+				deadline = record.TriggeredAt.Add(handshakeTimeout)
+			}
+			if !now.Before(deadline) {
+				return s.Position, 0, fmt.Errorf("[PDO-PP] handshake timeout: ACK did not complete HIGH/LOW cycle; sw=0x%04X sample=%d wkc=%d", s.Status, s.Sequence, s.WorkingCounter)
+			}
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		if completion == nil {
+			c := newPositionCompletion(d.desiredTargetPosition.Load(), motionPeriod(d), started)
+			completion = &c
+			if record := d.ppLatchRecord.Load(); record != nil {
+				completion.armMotion(record.Actual, int64(record.Value))
+				logger.Info("[PP-LATCH] drive=", d.Name, " preparedReference=", record.PreparedReference,
+					" actualAtTrigger=", record.Actual, " wireDelta=", record.Value,
+					" expected=", record.Expected, " prepareTime=", record.Waited)
+			} else {
+				completion.armMotion(initialPosition, int64(completion.goal)-int64(initialPosition))
+			}
+		}
+		modeReady := !d.PdoOpModeDisplayReady || s.Mode == 1
+		done, err := completion.observe(s, now, modeReady, d.Driver.IsTargetReached(s.Status))
+		if !done && !completion.endpointDeadline.IsZero() && now.Sub(lastObserverReport) >= 250*time.Millisecond {
+			logger.Info("[PDO-PP OBSERVE] drive=", d.Name, " goal=", completion.goal,
+				" actual=", s.Position, " signedResidual=", completion.residual(s),
+				" followingError=", s.FollowingError, " sw=", fmt.Sprintf("0x%04X", s.Status),
+				" sample=", s.Sequence, " ", completion.diagnostic())
+			lastObserverReport = now
+		}
+		r := completion.residual(s)
+		if r < 0 {
+			r = -r
+		}
+		if err != nil {
+			return s.Position, r, err
+		}
+		if done {
+			logger.Info("[PDO-PP ENDPOINT] drive=", d.Name, " goal=", completion.goal,
+				" actual=", s.Position, " signedResidual=", completion.residual(s),
+				" followingError=", s.FollowingError, " followingMapped=", s.FollowingErrorReady,
+				" demand=", s.demand(completion.period), " sw=", fmt.Sprintf("0x%04X", s.Status),
+				" sample=", s.Sequence, " sampleAt=", s.CapturedAt.Format(time.RFC3339Nano),
+				" wkc=", s.WorkingCounter, " elapsed=", now.Sub(started))
+			return s.Position, r, nil
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// checkPositionEndpoint also covers movement during standby/clamping.
+func checkPositionEndpoint(d *MasterDevice, goal int32) error {
+	deadline := time.Now().Add(positionFeedbackMaxAge)
+	var snapshot PDOFeedbackSnapshot
+	for {
+		if err := positionFeedbackStateError(d, true); err != nil {
+			return err
+		}
+		s, ok := d.ReadPDOFeedback()
+		age := time.Since(s.CapturedAt)
+		if ok && s.Valid && age >= 0 && age <= positionCompletionMaxGap {
+			if s.Status&0x0008 != 0 {
+				return fmt.Errorf("[PDO-PP] drive fault during final check: sw=0x%04X err=0x%04X", s.Status, s.ErrorCode)
+			}
+			snapshot = s
+			break
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("[PDO-PP] no fresh valid feedback for final endpoint check")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	actual := snapshot.Position
+	residual := positionResidual(d, goal, actual)
+	if residual < 0 {
+		residual = -residual
+	}
+	if residual > int64(positionPulseTolerance) {
+		return fmt.Errorf("%w: final check expected=%d actual=%d residualPulses=%d tolerancePulses=%d followingError=%d sw=0x%04X sample=%d",
+			errPositionSettleTimeout, goal, actual, residual, positionPulseTolerance, snapshot.FollowingError, snapshot.Status, snapshot.Sequence)
+	}
+	return nil
+}
+
+// failPositionMove stops cyclic motion and latches this axis until Reset.
+// Publish the alarm before the caller wakes the executor; the executor checks
+// that cached alarm synchronously before executing any subsequent command.
+func failPositionMove(d *MasterDevice, err error) error {
+	d.posMoveAborted.Store(true)
+	d.desiredTargetVelocity.Store(0)
+	d.EnableJogPDO(false)
+	d.EnablePosPDO(false)
+	notifyDriverStatus("motor_running", "false", d)
+	logger.Error("[PDO-PP] stopped drive=", d.Name, " error=", err)
+	statusnotifier.Alarm(fmt.Sprintf("[PDO-PP] move failed: %v", err))
+	return err
 }
 
 // freeRotate will not wait for ECS or will not send fin signal.
@@ -400,8 +406,12 @@ func runPositionGoal(masterDevice *MasterDevice, target MotionTarget, targetKind
 		return fmt.Errorf("PDO position mode not ready — SDO fallback removed")
 	}
 
+	if masterDevice.posMoveAborted.Load() || systemResetInProgress.Load() {
+		return fmt.Errorf("position move blocked until Reset")
+	}
+
 	logger.Info("[PDO] Starting rotation in PP mode targetKind=", targetKind,
-		" goal=", goal)
+		" goal=", goal, " policy=CYCLIC_LATE_LATCH tolerancePulses=", positionPulseTolerance, " corrections=0")
 
 	// Do not call FastPowerOn here. Once PDO cyclic control is active, the
 	// CiA-402 cyclic task owns servo state. FastPowerOn calls pdoStopMotion(),
@@ -437,143 +447,49 @@ func runPositionGoal(masterDevice *MasterDevice, target MotionTarget, targetKind
 	}
 	masterDevice.EnablePosPDO(true)
 
-	if err := hasTargetReached(masterDevice); err != nil {
-		masterDevice.EnablePosPDO(false)
-		// Clear the running flag so the user can press Reset.
-		notifyDriverStatus("motor_running", "false", masterDevice)
-		return err
+	moveStarted := time.Now()
+	settledPosition, settledResidual, settleErr := waitForPositionCompletion(masterDevice)
+	if settleErr != nil {
+		return failPositionMove(masterDevice, settleErr)
 	}
-
-	settleStarted := time.Now()
-	var settledPosition int32
-	var settledResidual int64
-	var settleErr error
-	for correction := 0; ; correction++ {
-		settledPosition, settledResidual, settleErr = waitForPositionSettle(masterDevice, goal)
-		if settleErr == nil {
-			break
-		}
-
-		// Recovery is limited to the validated Panasonic continuous path.
-		// Never retry a drive fault, emergency/reset, stale PDO or large error.
-		canCorrect := errors.Is(settleErr, errPositionSettleTimeout) &&
-			masterDevice.Device.ContinuousRotation &&
-			masterDevice.Device.DriveType == "a6_minas" &&
-			correction < positionCorrectionAttempts &&
-			settledResidual > int64(positionPulseTolerance) &&
-			settledResidual <= positionCorrectionMaxPulses
-		if canCorrect {
-			if err := correctPositionEndpoint(masterDevice, goal, correction+1); err == nil {
-				continue
-			} else {
-				settleErr = fmt.Errorf("%w; endpoint correction refused: %v", settleErr, err)
-			}
-		}
-
-		masterDevice.EnablePosPDO(false)
-		notifyDriverStatus("motor_running", "false", masterDevice)
-		logger.Error("[PDO-PP SETTLE] drive=", masterDevice.Name,
-			" targetKind=", targetKind, " error=", settleErr)
-		return settleErr
-	}
+	// G91's endpoint is finalized by the acknowledged cyclic latch; G90's
+	// fixed endpoint is never replaced with actual position.
+	goal = masterDevice.desiredTargetPosition.Load()
 
 	logger.Info("[PDO-PP SETTLED] drive=", masterDevice.Name,
 		" targetKind=", targetKind,
 		" goal=", goal,
 		" actual=", settledPosition,
 		" residualPulses=", settledResidual,
-		" settleTime=", time.Since(settleStarted))
+		" completionTime=", time.Since(moveStarted))
 
-	// PP remains active throughout settling. Only hand over to standby after
-	// both drive completion and endpoint tolerance have stayed stable.
-	masterDevice.EnablePosPDO(false)
-	logger.Info("[POST-REACH] phase=PP_DISABLED drive=", masterDevice.Name,
-		" goal=", goal, " actual=", masterDevice.PDOPos.Load())
-
-	notifyDriverStatus("motor_running", "false", masterDevice)
+	// Keep PP active until the existing clamp sequence takes ownership.
+	// That sequence may intentionally disable the servo after commanding the
+	// brake. Its power/IO ordering remains unchanged; no new bit4 is generated.
 
 	// FIN is allowed only after the clamp sequence has completed. Do not hide
 	// clamp errors: an open/unknown clamp state must fail the movement.
 	if _, clampErr := hasClamped(masterDevice, envSettings); clampErr != nil {
-		logger.Error("[BRAKE-SEQ] phase=CLAMP_FAILED drive=", masterDevice.Name,
-			" error=", clampErr)
-		statusnotifier.Alarm(clampErr.Error())
-		return clampErr
+		return failPositionMove(masterDevice, fmt.Errorf("clamp failed: %w", clampErr))
 	}
+	if err := positionFeedbackStateError(masterDevice, envSettings.ClampDeclamp != 0); err != nil {
+		return failPositionMove(masterDevice, err)
+	}
+
+	// The mechanical clamp can shift feedback after settling.
+	// Validate the final endpoint again before the caller is allowed to FIN.
+	if err := checkPositionEndpoint(masterDevice, goal); err != nil {
+		return failPositionMove(masterDevice, err)
+	}
+
+	masterDevice.EnablePosPDO(false)
+	notifyDriverStatus("motor_running", "false", masterDevice)
+	logger.Info("[POST-REACH] phase=PP_DISABLED drive=", masterDevice.Name, " goal=", goal, " actual=", masterDevice.PDOPos.Load())
 
 	logger.Info("[PDO-PP] rotation completed successfully targetKind=", targetKind,
 		" goal=", goal, " final=", masterDevice.PDOPos.Load())
 
 	return nil
-}
-
-// waitForPositionSettle observes feedback without issuing another movement.
-// The initial hold is retained, but one out-of-window sample now resets the
-// stability timer instead of immediately failing the move. The deadline bounds
-// the entire wait, including the initial hold. positionResidual preserves the
-// existing normal/continuous endpoint calculation.
-func waitForPositionSettle(masterDevice *MasterDevice, goal int32) (int32, int64, error) {
-	const (
-		settleTimeout = time.Second
-		stableWindow = 50 * time.Millisecond
-		pollInterval = 5 * time.Millisecond
-		maxSampleGap = 20 * time.Millisecond
-	)
-
-	started := time.Now()
-	deadline := started.Add(settleTimeout)
-	lastSample := started
-	var stableFrom time.Time
-
-	for {
-		now := time.Now()
-		actual := masterDevice.PDOPos.Load()
-		residual := positionResidual(masterDevice, goal, actual)
-		if residual < 0 {
-			residual = -residual
-		}
-
-		if !IsPDOActive() || !masterDevice.PdoPosReady {
-			return actual, residual, fmt.Errorf("[PDO-PP SETTLE] aborted: PDO position feedback unavailable")
-		}
-		if masterDevice.posMoveAborted.Load() || !masterDevice.IsPosEnabled() {
-			return actual, residual, fmt.Errorf("[PDO-PP SETTLE] aborted: position move cancelled")
-		}
-		if healthy, age := PDOHealthy(); !healthy {
-			return actual, residual, fmt.Errorf("[PDO-PP SETTLE] aborted: stale PDO heartbeat, age=%s", age)
-		}
-		sw := uint16(masterDevice.PDOStatus.Load() & 0xFFFF)
-		if sw&0x0008 != 0 {
-			return actual, residual, fmt.Errorf("[PDO-PP SETTLE] drive fault: sw=0x%04X err=0x%04X",
-				sw, uint16(masterDevice.PDOErr.Load()&0xFFFF))
-		}
-		if sw&0x006F != 0x0027 {
-			return actual, residual, fmt.Errorf("[PDO-PP SETTLE] aborted: drive left Operation Enabled, sw=0x%04X", sw)
-		}
-		if !now.Before(deadline) {
-			return actual, residual, fmt.Errorf("%w: expected=%d actual=%d residualPulses=%d tolerancePulses=%d sw=0x%04X elapsed=%s",
-				errPositionSettleTimeout, goal, actual, residual, positionPulseTolerance, sw, now.Sub(started))
-		}
-
-		// A scheduling gap is not evidence of continuous stability.
-		if now.Sub(lastSample) > maxSampleGap {
-			stableFrom = time.Time{}
-		}
-		lastSample = now
-
-		if now.Sub(started) >= positionSettleTime &&
-			!masterDevice.ppSetpointPending.Load() &&
-			residual <= int64(positionPulseTolerance) {
-			if stableFrom.IsZero() {
-				stableFrom = now
-			} else if now.Sub(stableFrom) >= stableWindow {
-				return actual, residual, nil
-			}
-		} else {
-			stableFrom = time.Time{}
-		}
-		time.Sleep(pollInterval)
-	}
 }
 
 // correctionForEndpoint builds only a short move to the SAME wrapped endpoint.
@@ -596,7 +512,7 @@ func correctionForEndpoint(goal, actual int32, period, maxPulses int64) (PPComma
 		return PPCommand{}, fmt.Errorf("correction distance %d outside allowed range %d..%d pulses",
 			delta, positionPulseTolerance+1, maxPulses)
 	}
-	return PPCommand{Value: int32(delta), Expected: goal}, nil
+	return PPCommand{Value: int32(delta), Expected: goal, Reference: actual, LateBound: true}, nil
 }
 
 // correctPositionEndpoint runs only after the original move's bounded settling

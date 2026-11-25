@@ -505,7 +505,29 @@ func canExecuteGivenCommands(commands []dt.Command) error {
 // executeCommands — recursive execution engine
 // ---------------------------------------------------------------------------
 
+// stopOnMotionAlarm is called by the execution goroutine itself, before
+// dispatch and immediately after each blocking handler returns. It therefore
+// does not depend on the asynchronous stop_prog_exec listener winning a race.
+func stopOnMotionAlarm(ctx *dt.ExecutionContext, commandIndex int) error {
+	if ctx.TrialModeActive {
+		return nil
+	}
+	alarm := motor.GetCurrentAlarm()
+	if alarm == "No Alarms" {
+		return nil
+	}
+	ctx.StopExecution = true
+	ctx.NextLineWhenStopped = commandIndex
+	dt.ExecController.Cancel()
+	saveLastLine(commandIndex)
+	logger.Error("[EXECUTOR] Stopped at line ", commandIndex, ": ", alarm)
+	return fmt.Errorf("program stopped: %s", alarm)
+}
+
 func executeCommands(commands []dt.Command, nextCommandIndex int) error {
+	if err := stopOnMotionAlarm(&execContext, nextCommandIndex); err != nil {
+		return err
+	}
 	if execContext.StopExecution {
 		logger.Info("Execution stopped. Unwinding command calls...")
 		return nil
@@ -593,6 +615,10 @@ func executeCommands(commands []dt.Command, nextCommandIndex int) error {
 		}
 	}
 
+	if err := stopOnMotionAlarm(&execContext, nextCommandIndex); err != nil {
+		return err
+	}
+
 	if execContext.StopExecution {
 		if execContext.HasResetted {
 			// Reset pressed — always restart from line 0.
@@ -651,6 +677,9 @@ func executeCommand(cmd dt.Command, execContext *dt.ExecutionContext, currentCmd
 		}
 		cmd.ConsiderInBlockExecution = commandToExec.ConsiderInBlockExecution
 		results := funcToExec.Handle(cmd, execContext)
+		if err := stopOnMotionAlarm(execContext, currentCmdIndex); err != nil {
+			return false, err
+		}
 		if execContext.Err != nil {
 			logger.Error("Error executing command "+cmd.Cmd, execContext.Err)
 			return false, execContext.Err
@@ -684,7 +713,13 @@ func executeInLineParamFunction(funcToExec h.Handler, cmd dt.Command, execContex
 		if result.ShouldExecute {
 			paramToExec := funcMap[result.Cmd.Func]
 			if paramToExec != nil {
+				if err := stopOnMotionAlarm(execContext, execContext.CurrentExecCommandLine); err != nil {
+					return err
+				}
 				childResults := paramToExec.Handle(result.Cmd, execContext)
+				if err := stopOnMotionAlarm(execContext, execContext.CurrentExecCommandLine); err != nil {
+					return err
+				}
 				if execContext.Err != nil {
 					logger.Error("Error executing command "+cmd.Cmd, execContext.Err)
 					return execContext.Err

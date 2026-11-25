@@ -458,6 +458,7 @@ func StartPDOCyclic(devices []*MasterDevice) error {
 	// Must be per-device so two simultaneous PP moves on different axes don't
 	// interfere with each other's set-point acknowledgement.
 	latchCounters := make([]int, len(devices))
+	relativeLatches := make([]ppRelativeLatch, len(devices))
 
 	go func() {
 		runtime.LockOSThread()    // 1. Lock Go scheduler to this OS thread
@@ -549,38 +550,69 @@ func StartPDOCyclic(devices []*MasterDevice) error {
 
 					// Process this device's domain slice.
 					C.ecrt_domain_process(d.Domain)
+					var domainState C.ec_domain_state_t
+					C.ecrt_domain_state(d.Domain, &domainState)
+					feedbackValid := domainState.wc_state == C.EC_WC_COMPLETE && domainState.working_counter > 0
 
-					// ── Read TxPDO (drive → master) ───────────────────────
-					var status uint16
+					// Read the entire snapshot from this domain-process result.
+					// Invalid exchanges must not overwrite legacy UI/HAL caches.
+					var status, errorCode uint16
+					var position, followingError int32
+					var mode int8
 					if d.PdoStatusReady {
 						status = uint16(C.read_u16(d.DomainPD, d.OffStatus))
-						d.PDOStatus.Store(uint32(status))
-					}
-					if d.PdoReady {
-						pos := C.read_s32(d.DomainPD, d.OffPos)
-						d.PDOPos.Store(int32(pos))
-					}
-					if d.PdoErrorReady {
-						ec := C.read_u16(d.DomainPD, d.OffErrorCode)
-						// Only cache error code when drive is in Fault (bit3=1).
-						// 0x603F is hardware-latching on A6 — never auto-clears.
-						// Caching unconditionally would re-fire alarm 87 after reset.
-						if status&0x0008 != 0 {
-							d.PDOErr.Store(uint32(ec))
-						} else {
-							d.PDOErr.Store(0)
+						if feedbackValid {
+							d.PDOStatus.Store(uint32(status))
 						}
 					}
-					if d.PdoDIReady {
+					if d.PdoReady {
+						position = int32(C.read_s32(d.DomainPD, d.OffPos))
+						if feedbackValid {
+							d.PDOPos.Store(position)
+						}
+					}
+					if d.PdoErrorReady {
+						errorCode = uint16(C.read_u16(d.DomainPD, d.OffErrorCode))
+						// 603F is hardware-latching on A6. Keep the existing legacy
+						// alarm cache filtered by fault bit; retain raw code in snapshot.
+						if feedbackValid {
+							if status&0x0008 != 0 {
+								d.PDOErr.Store(uint32(errorCode))
+							} else {
+								d.PDOErr.Store(0)
+							}
+						}
+					}
+					if d.PdoDIReady && feedbackValid {
 						di := C.read_u32(d.DomainPD, d.OffDigitalInputs)
 						d.PDODI.Store(uint32(di))
 					}
-					// 0x6061 Op-mode display — the drive's ACTIVE operating mode.
-					// Differs from 0x6060 (commanded mode) during mode transitions.
-					// Only populated when the YAML maps op_mode_display (e.g. Delta).
 					if d.PdoOpModeDisplayReady {
-						omd := int8(C.read_s8(d.DomainPD, d.OffOpModeDisplay))
-						d.PDOOpModeDisplay.Store(int32(omd))
+						mode = int8(C.read_s8(d.DomainPD, d.OffOpModeDisplay))
+						if feedbackValid {
+							d.PDOOpModeDisplay.Store(int32(mode))
+						}
+					}
+					if d.PdoFollowingErrorReady {
+						followingError = int32(C.read_s32(d.DomainPD, d.OffFollowingError))
+						if feedbackValid {
+							d.PDOFollowingError.Store(followingError)
+						}
+					}
+					outsideEndpoint := false
+					if feedbackValid && d.IsPosEnabled() {
+						r := positionResidual(d, d.desiredTargetPosition.Load(), position)
+						outsideEndpoint = r > int64(positionPulseTolerance) || r < -int64(positionPulseTolerance)
+					}
+					d.pdoFeedback.publish(PDOFeedbackSnapshot{
+						CapturedAt: time.Now(), Valid: feedbackValid,
+						WorkingCounter: uint32(domainState.working_counter),
+						Position:       position, Status: status, ErrorCode: errorCode, Mode: mode,
+						FollowingError: followingError, FollowingErrorReady: d.PdoFollowingErrorReady,
+						EndpointViolation: outsideEndpoint,
+					})
+					if !feedbackValid {
+						status = uint16(d.PDOStatus.Load())
 					}
 
 					// ── CiA-402 state machine ─────────────────────────────
@@ -615,6 +647,8 @@ func StartPDOCyclic(devices []*MasterDevice) error {
 					if opEnabled {
 						switch {
 						case d.IsJogEnabled():
+							latchCounters[idx] = 0
+							relativeLatches[idx].reset()
 							// Profile Velocity (Mode 3)
 							cwJog := uint16(d.desiredControlWord.Load() & 0xFFFF)
 							if cwJog == 0 || cwJog == 0x000F {
@@ -660,78 +694,84 @@ func StartPDOCyclic(devices []*MasterDevice) error {
 							d.currentTargetPosition.Store(actual)
 
 						case d.IsPosEnabled():
-							// Profile Position (Mode 1)
+							C.write_s8(d.DomainPD, d.OffOpMode, C.int8_t(1))
+							C.write_s32(d.DomainPD, d.OffTargetVel, C.int32_t(0))
 							goal := d.desiredTargetPosition.Load()
+							cwPos := uint16(0x000F)
 							command := d.ppRelativeCommand.Load()
 							if command != nil {
-								goal = command.Value
-							}
-							C.write_s8(d.DomainPD, d.OffOpMode, C.int8_t(1))
-							C.write_s32(d.DomainPD, d.OffTargetPos, C.int32_t(goal))
-							C.write_s32(d.DomainPD, d.OffTargetVel, C.int32_t(0))
-
-							// Panasonic A6 manual SX-DSV03242, Profile Position mode:
-							//   1. Write 607Ah target position.
-							//   2. Raise 6040h bit4 (new set-point) from 0 to 1.
-							//   3. After 6041h bit12 acknowledges, drop bit4 back to 0.
-							//   4. Drive clears bit12, then later raises bit10 at target.
-							//
-							// Keep bit5 (change set immediately) LOW for the normal one-command
-							// sequence. We do not queue or replace targets while another PP move
-							// is in progress; the executor waits for each move to finish.
-							base := uint16(0x000F)
-							if command != nil {
-								base |= 0x0040 // keep relative type throughout this command
-							}
-							if d.ppSetpointPending.Load() {
-								// Profile Position set-point handshake (CiA-402 §9.4.2):
-								//
-								// Phase 1 (latchCounters < 10): hold bit4 LOW for 10 cycles (~10ms)
-								//   so the drive latches the new target position before we assert
-								//   the new set-point bit. Writing bit4 HIGH too early causes the
-								//   drive to acknowledge the PREVIOUS position, not the new one.
-								//
-								// Phase 2 (latchCounters >= 10): assert bit4 HIGH (base|0x0010).
-								//   Exit when the drive acknowledges (bit12 HIGH) or after 30 cycles.
-								//
-								// FIX (Bug 8): Do NOT reset latchCounters in the else branch.
-								//
-								// The old else branch reset latchCounters[idx] to 0 on EVERY tick
-								// when ppSetpointPending was false. This wiped the counter between
-								// consecutive moves. When the next move called SetTargetPositionPDO
-								// (which sets ppSetpointPending=true), the counter always started
-								// from 0 — adding an unnecessary 10ms Phase 1 delay even when the
-								// drive had already stabilised at the previous position and was
-								// ready to accept a new set-point immediately.
-								//
-								// The counter is now only reset when the handshake COMPLETES
-								// (ppSetpointPending transitions true→false). Between moves the
-								// counter stays at whatever value it was when the last handshake
-								// finished — typically 10-30. The next move skips Phase 1 entirely
-								// and asserts bit4 HIGH on the first tick, cutting set-point
-								// acknowledgement latency from ~10ms to ~1ms on consecutive moves.
-								if latchCounters[idx] < 10 {
-									latchCounters[idx]++
-									C.write_u16(d.DomainPD, d.OffControlWord, C.uint16_t(base))
-								} else {
-									C.write_u16(d.DomainPD, d.OffControlWord, C.uint16_t(base|0x0010))
-									latchCounters[idx]++
-									if (status&0x1000) != 0 || latchCounters[idx] > 30 {
-										d.ppSetpointPending.Store(false)
-										latchCounters[idx] = 0 // reset only on handshake completion
+								cwPos |= 0x0040
+								latchCounters[idx] = 0
+								latch := &relativeLatches[idx]
+								if !feedbackValid {
+									output := latch.holdOnInvalidFeedback(command)
+									goal, cwPos = output.Command.Value, output.Controlword
+								} else if d.ppSetpointPending.Load() && d.ppPrepareError.Load() == nil {
+									modeReady := !d.PdoOpModeDisplayReady || d.PDOOpModeDisplay.Load() == 1
+									actual := d.PDOPos.Load() // feedback from this domain_process
+									now := time.Now()
+									output, err := latch.step(command, actual, status, modeReady, d.continuousPeriod, now)
+									if err != nil {
+										d.ppPrepareError.Store(&ppCommandError{Message: err.Error()})
+									} else {
+										goal = output.Command.Value
+										cwPos = output.Controlword
+										if output.Triggered {
+											d.desiredTargetPosition.Store(output.Command.Expected)
+											d.ppLatchRecord.Store(&ppLatchRecord{PreparedReference: command.Reference, Actual: actual,
+												Value: output.Command.Value, Expected: output.Command.Expected, Waited: now.Sub(latch.firstSeen), TriggeredAt: now})
+										}
+										if output.Acknowledged {
+											d.ppSetpointPending.Store(false)
+										}
+									}
+								} else if !d.ppSetpointPending.Load() {
+									// Hold the exact latched distance with bit4 LOW. Never
+									// re-evaluate or re-trigger a command after acknowledgement.
+									if latch.source == command && latch.triggered {
+										goal = latch.wire.Value
+									} else {
+										d.ppPrepareError.Store(&ppCommandError{Message: "relative PP latch state lost; refusing to re-trigger motion"})
 									}
 								}
 							} else {
-								// Manual PP hold state: keep operation enabled, mode 1,
-								// target position = last commanded goal, bit4 LOW.
-								// This keeps the drive holding the last 607Ah target until
-								// the next command calls SetTargetPositionPDO/EnablePosPDO(true)
-								// and creates a fresh bit4 rising edge.
-								C.write_u16(d.DomainPD, d.OffControlWord, C.uint16_t(base))
+								// Ordinary absolute PP retains its existing payload semantics.
+								relativeLatches[idx].reset()
+								if d.ppSetpointPending.Load() && feedbackValid {
+									if latchCounters[idx] < 10 {
+										if status&0x1000 != 0 {
+											latchCounters[idx] = 0
+										} else {
+											latchCounters[idx]++
+										}
+									} else {
+										cwPos |= 0x0010
+										if status&0x1000 != 0 {
+											cwPos = 0x000F
+											d.ppSetpointPending.Store(false)
+											latchCounters[idx] = 0
+										}
+									}
+								} else if d.ppSetpointPending.Load() && !feedbackValid {
+									if latchCounters[idx] >= 10 {
+										cwPos |= 0x0010
+									} else {
+										latchCounters[idx] = 0
+									}
+								}
 							}
+							// Stop/reset may have cancelled this command while its next
+							// PDO output was being calculated. Do not send a new rising edge.
+							if d.posMoveAborted.Load() || systemResetInProgress.Load() || !d.IsPosEnabled() {
+								cwPos = 0x000F
+							}
+							C.write_s32(d.DomainPD, d.OffTargetPos, C.int32_t(goal))
+							C.write_u16(d.DomainPD, d.OffControlWord, C.uint16_t(cwPos))
 							d.currentTargetPosition.Store(goal)
 
 						default:
+							latchCounters[idx] = 0
+							relativeLatches[idx].reset()
 							// Standby / Shutdown / Multiturn reset
 							if d.pdoShutdownActive.Load() || d.pdoMTResetActive.Load() || d.pdoForcedServoCycleActive.Load() {
 								C.write_u16(d.DomainPD, d.OffControlWord, C.uint16_t(0x0006))
@@ -739,8 +779,8 @@ func StartPDOCyclic(devices []*MasterDevice) error {
 								C.write_u16(d.DomainPD, d.OffControlWord, C.uint16_t(0x000F))
 							}
 							// HAL: StandbyOpMode is drive-specific.
-							//   A6Minas / DeltaASDA2E → Mode 3 (Profile Velocity, vel=0):
-							//     silent standby via velocity loop, no jerk, no beeping.
+							//   The selected HAL driver decides whether standby is PP, PV or CSP.
+							//   A6 stays in PP in the supplied A6 driver; do not infer its mode here.
 							//   NidecM700 → Mode 8 (CSP): Mode 3 vel=0 causes 0xFF01 drive
 							//     trips on Nidec; CSP with position hold is required.
 							C.write_s8(d.DomainPD, d.OffOpMode, C.int8_t(d.Driver.StandbyOpMode()))
@@ -751,6 +791,8 @@ func StartPDOCyclic(devices []*MasterDevice) error {
 						}
 
 					} else {
+						latchCounters[idx] = 0
+						relativeLatches[idx].reset()
 						// Not yet in Operation Enabled
 						// FIX 1: DO NOT force 0x000F. Let cia402NextControlword safely step through 0x06 -> 0x07 -> 0x0F.
 						if d.IsJogEnabled() && (status&0x0008) == 0 {

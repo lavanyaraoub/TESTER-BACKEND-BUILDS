@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 )
@@ -44,6 +45,10 @@ type MasterDevice struct {
 	// callers. Per-device access uses these fields directly.
 	PDOPos    atomic.Int32  // 0x6064 Position actual value  — written by cyclic task
 	PDOStatus atomic.Uint32 // 0x6041 Statusword             — written by cyclic task
+	// Motion decisions read this coherent cache rather than mixing atomics
+	// from different domain-process cycles. Legacy atomics remain for UI/HAL.
+	pdoFeedback       pdoFeedbackCache
+	PDOFollowingError atomic.Int32 // signed 0x60F4, for diagnostics
 
 	// AposCorrection compensates a boot-time encoder sign flip detected by
 	// InitAposCorrection(). Per-device field replaces the old package-level
@@ -68,11 +73,12 @@ type MasterDevice struct {
 	DomainPD *C.uint8_t
 
 	// ---- TxPDO offsets (drive → master, read each cycle) ----
-	OffPos           C.uint // 0x6064 Position actual value   (S32)
-	OffStatus        C.uint // 0x6041 Statusword              (U16)
-	OffErrorCode     C.uint // 0x603F Error code              (U16)
-	OffDigitalInputs C.uint // 0x4F25 Input signal register (vendor, replaces 0x60FD) (U32)
-	OffOpModeDisplay C.uint // 0x6061 Op-mode display (S8, TxPDO) — read-back of active mode
+	OffPos            C.uint // 0x6064 Position actual value   (S32)
+	OffStatus         C.uint // 0x6041 Statusword              (U16)
+	OffErrorCode      C.uint // 0x603F Error code              (U16)
+	OffDigitalInputs  C.uint // 0x4F25 Input signal register (vendor, replaces 0x60FD) (U32)
+	OffOpModeDisplay  C.uint // 0x6061 Op-mode display (S8, TxPDO) — read-back of active mode
+	OffFollowingError C.uint // 0x60F4 signed following error; zero is a valid offset
 
 	// ---- RxPDO offsets (master → drive, written each cycle) ----
 	// All come from PDO 0x1601 (the only RxPDO in the ESI that has 0x60FF).
@@ -107,15 +113,16 @@ type MasterDevice struct {
 	PdoVelSdoReq      unsafe.Pointer // Pointer to the ec_sdo_request_t for 0x6081
 
 	// ---- PDO readiness flags ----
-	PdoReady              bool // TxPDO 0x6064 registered
-	PdoStatusReady        bool // TxPDO 0x6041 registered
-	PdoErrorReady         bool // TxPDO 0x603F registered
-	PdoDIReady            bool // TxPDO 0x4F25 registered (input signal register, vendor-specific)
-	PdoOpModeDisplayReady bool // TxPDO 0x6061 registered — confirms actual active op-mode
-	PdoDigOutReady        bool // RxPDO 0x60FE:01/02 offsets resolved (physical digital outputs)
-	PdoRxReady            bool // ALL RxPDO entries registered (0x1600 fully mapped)
-	PdoJogReady           bool // RxPDO ready for jog (same as PdoRxReady)
-	PdoPosReady           bool // RxPDO ready for position (same as PdoRxReady)
+	PdoReady               bool // TxPDO 0x6064 registered
+	PdoStatusReady         bool // TxPDO 0x6041 registered
+	PdoErrorReady          bool // TxPDO 0x603F registered
+	PdoDIReady             bool // TxPDO 0x4F25 registered (input signal register, vendor-specific)
+	PdoOpModeDisplayReady  bool // TxPDO 0x6061 registered — confirms actual active op-mode
+	PdoFollowingErrorReady bool // TxPDO 0x60F4 registered, including legacy padding name
+	PdoDigOutReady         bool // RxPDO 0x60FE:01/02 offsets resolved (physical digital outputs)
+	PdoRxReady             bool // ALL RxPDO entries registered (0x1600 fully mapped)
+	PdoJogReady            bool // RxPDO ready for jog (same as PdoRxReady)
+	PdoPosReady            bool // RxPDO ready for position (same as PdoRxReady)
 
 	// Motion enable flags — atomic.Bool (read by 1ms cyclic, written by motion goroutines).
 	pdoJogEnabled atomic.Bool // use EnableJogPDO()/IsJogEnabled()
@@ -132,12 +139,13 @@ type MasterDevice struct {
 	continuousPeriod      int64        // immutable after startup validation; zero for ordinary axes
 	homingGeometry        string
 	ppRelativeCommand     atomic.Pointer[PPCommand]
+	ppPrepareError        atomic.Pointer[ppCommandError]
+	ppLatchRecord         atomic.Pointer[ppLatchRecord]
 	desiredTargetPosition atomic.Int32
 	currentTargetPosition atomic.Int32
 	ppSetpointPending     atomic.Bool // one-shot pulse for Profile Position new set-point (bit4)
-	// posMoveAborted: set to true by emergency() when it cancels an in-flight PP move.
-	// hasTargetReached polls this flag and exits immediately instead of waiting for the
-	// 30-second timeout. Cleared by hasTargetReached on exit.
+	// posMoveAborted latches emergency and position-failure stops. Motion
+	// waiters observe it without clearing it; Reset clears it explicitly.
 	posMoveAborted atomic.Bool
 
 	Position int
@@ -145,10 +153,13 @@ type MasterDevice struct {
 	Device   ethercatDevice.Device
 }
 
+// ReadPDOFeedback returns a bounded, coherent copy without locking the cyclic writer.
+func (d *MasterDevice) ReadPDOFeedback() (PDOFeedbackSnapshot, bool) {
+	return d.pdoFeedback.load()
+}
+
 // RequestMaster requests a master from the IgH kernel module.
-// Note: domain and slave config are set up separately in SetupPDOPosition;
-// this function intentionally does NOT create them so that the caller can
-// choose whether to run in PDO or pure SDO mode.
+// Domain and slave configuration are created separately in SetupPDOPosition.
 func RequestMaster(device ethercatDevice.Device) (*C.ec_master_t, error) {
 	// FIX (Bug 1): Always pass master index 0 to ecrt_request_master.
 	// device.ID is the EtherCAT ring position of the first slave — not the
@@ -220,11 +231,69 @@ func runSDOOperation(master *C.ec_master_t, position int, operation ethercatDevi
 	}
 }
 
-// SDOUpload performs an ecrt_master_sdo_upload read from the drive.
+// sdoUploadFailure preserves the OS errno separately from a drive's CoE abort.
+// EINTR is an interrupted host read; a nonzero CoE abort must never be hidden.
+type sdoUploadFailure struct {
+	DataType          string
+	Address, SubIndex int
+	Errno             syscall.Errno
+	AbortCode         uint32
+}
+
+func (e *sdoUploadFailure) Error() string {
+	return fmt.Sprintf("SDOUpload %s failed at 0x%04X:%02X: %s (abort=0x%08X)",
+		e.DataType, e.Address, e.SubIndex, e.Errno, e.AbortCode)
+}
+
+func (e *sdoUploadFailure) Unwrap() error { return e.Errno }
+
+// retryStartupSDORead retries read-only EINTR failures before PDO activation.
+// Once the cyclic task is active, existing SDO ownership/timing is unchanged.
+// The attempt count is bounded; individual read timeouts remain EtherLab's.
+func retryStartupSDORead(position int, step ethercatDevice.Step, read func() (int32, error)) (int32, error) {
+	const attempts = 5
+	const delay = 50 * time.Millisecond
+	for attempt := 1; attempt <= attempts; attempt++ {
+		value, err := read()
+		if err == nil {
+			return value, nil
+		}
+		var failure *sdoUploadFailure
+		if errors.As(err, &failure) && failure.AbortCode != 0 {
+			return 0, err
+		}
+		if IsPDOActive() || !errors.Is(err, syscall.EINTR) {
+			return 0, err
+		}
+		if attempt == attempts {
+			return 0, fmt.Errorf("%w; startup read exhausted %d attempts", err, attempts)
+		}
+		logger.Warn("[SDO-READ RETRY] slave=", position,
+			" index=", fmt.Sprintf("0x%04X:%02X", step.Address, step.SubIndex),
+			" type=", step.DataType, " attempt=", attempt, "/", attempts, " error=", err)
+		time.Sleep(delay)
+		// Do not introduce another blocking read if ownership changed during
+		// the backoff. Startup itself activates PDO only after these reads finish.
+		if IsPDOActive() {
+			return 0, err
+		}
+	}
+	return 0, errors.New("startup SDO read exhausted")
+}
+
+// SDOUpload preserves typed data reads and retries only interrupted startup
+// reads. Successful reads, drive aborts and active-PDO reads are not repeated.
+func SDOUpload(master *C.ec_master_t, position int, step ethercatDevice.Step) (int32, error) {
+	return retryStartupSDORead(position, step, func() (int32, error) {
+		return sdoUploadOnce(master, position, step)
+	})
+}
+
+// sdoUploadOnce performs exactly one read, without retrying or changing parameters.
 // Uses correctly sized buffers for each data type so multi-byte
 // reads are not silently truncated.
-func SDOUpload(master *C.ec_master_t, position int, step ethercatDevice.Step) (int32, error) {
-	abortCode := 0
+func sdoUploadOnce(master *C.ec_master_t, position int, step ethercatDevice.Step) (int32, error) {
+	var abortCode C.uint32_t
 	var toReturn int32
 
 	switch step.DataType {
@@ -232,45 +301,45 @@ func SDOUpload(master *C.ec_master_t, position int, step ethercatDevice.Step) (i
 		var v C.uint32_t
 		ret := C.sdo_upload(master, C.uint16_t(position), C.uint16_t(step.Address),
 			C.uint8_t(step.SubIndex), (*C.uint8_t)(unsafe.Pointer(&v)),
-			C.uint32Size(), (*C.uint32_t)(unsafe.Pointer(&abortCode)))
+			C.uint32Size(), &abortCode)
 		if ret < 0 {
-			return 0, fmt.Errorf("SDOUpload U32 failed: %s", C.GoString(C.strerror(-ret)))
+			return 0, &sdoUploadFailure{DataType: "U32", Address: step.Address, SubIndex: step.SubIndex, Errno: syscall.Errno(-ret), AbortCode: uint32(abortCode)}
 		}
 		toReturn = int32(v)
 	case "U16":
 		var v C.uint16_t
 		ret := C.sdo_upload(master, C.uint16_t(position), C.uint16_t(step.Address),
 			C.uint8_t(step.SubIndex), (*C.uint8_t)(unsafe.Pointer(&v)),
-			C.uint16Size(), (*C.uint32_t)(unsafe.Pointer(&abortCode)))
+			C.uint16Size(), &abortCode)
 		if ret < 0 {
-			return 0, fmt.Errorf("SDOUpload U16 failed: %s", C.GoString(C.strerror(-ret)))
+			return 0, &sdoUploadFailure{DataType: "U16", Address: step.Address, SubIndex: step.SubIndex, Errno: syscall.Errno(-ret), AbortCode: uint32(abortCode)}
 		}
 		toReturn = int32(v)
 	case "I32":
 		var v C.int32_t
 		ret := C.sdo_upload(master, C.uint16_t(position), C.uint16_t(step.Address),
 			C.uint8_t(step.SubIndex), (*C.uint8_t)(unsafe.Pointer(&v)),
-			C.int32Size(), (*C.uint32_t)(unsafe.Pointer(&abortCode)))
+			C.int32Size(), &abortCode)
 		if ret < 0 {
-			return 0, fmt.Errorf("SDOUpload I32 failed: %s", C.GoString(C.strerror(-ret)))
+			return 0, &sdoUploadFailure{DataType: "I32", Address: step.Address, SubIndex: step.SubIndex, Errno: syscall.Errno(-ret), AbortCode: uint32(abortCode)}
 		}
 		toReturn = int32(v)
 	case "I16":
 		var v C.int16_t
 		ret := C.sdo_upload(master, C.uint16_t(position), C.uint16_t(step.Address),
 			C.uint8_t(step.SubIndex), (*C.uint8_t)(unsafe.Pointer(&v)),
-			C.int16Size(), (*C.uint32_t)(unsafe.Pointer(&abortCode)))
+			C.int16Size(), &abortCode)
 		if ret < 0 {
-			return 0, fmt.Errorf("SDOUpload I16 failed: %s", C.GoString(C.strerror(-ret)))
+			return 0, &sdoUploadFailure{DataType: "I16", Address: step.Address, SubIndex: step.SubIndex, Errno: syscall.Errno(-ret), AbortCode: uint32(abortCode)}
 		}
 		toReturn = int32(v)
 	default: // U8 / I8 / UINT / fallback
 		var v C.uint8_t
 		ret := C.sdo_upload(master, C.uint16_t(position), C.uint16_t(step.Address),
 			C.uint8_t(step.SubIndex), (*C.uint8_t)(unsafe.Pointer(&v)),
-			C.uint8Size(), (*C.uint32_t)(unsafe.Pointer(&abortCode)))
+			C.uint8Size(), &abortCode)
 		if ret < 0 {
-			return 0, fmt.Errorf("SDOUpload U8 failed: %s", C.GoString(C.strerror(-ret)))
+			return 0, &sdoUploadFailure{DataType: "U8", Address: step.Address, SubIndex: step.SubIndex, Errno: syscall.Errno(-ret), AbortCode: uint32(abortCode)}
 		}
 		toReturn = int32(v)
 	}
@@ -392,6 +461,8 @@ func (d *MasterDevice) SetTargetPositionPDO(targetPosition int32) error {
 	if !d.PdoPosReady {
 		return fmt.Errorf("SetTargetPositionPDO: PdoPosReady=false — RxPDO not configured")
 	}
+	d.ppPrepareError.Store(nil)
+	d.ppLatchRecord.Store(nil)
 	d.ppRelativeCommand.Store(nil) // absolute targets and holds must never inherit relative mode
 	d.desiredTargetPosition.Store(targetPosition)
 	// ensure next cyclic tick triggers a new set-point pulse (PP mode)

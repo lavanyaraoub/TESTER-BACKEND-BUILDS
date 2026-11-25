@@ -10,10 +10,10 @@ package motordriver
 import "C"
 
 import (
+	"EtherCAT/helper"
 	"fmt"
 	"os"
 	"unsafe"
-	"EtherCAT/helper"
 
 	logger "EtherCAT/logger"
 	"gopkg.in/yaml.v2"
@@ -52,11 +52,11 @@ import (
 // PDOEntry describes one CoE object in a PDO.
 // Maps directly to one entry block in the YAML pdo: section:
 //
-//   entries:
-//     - index:    0x6040
-//       subindex: 0x00
-//       bits:     16
-//       name:     ctrl_word
+//	entries:
+//	  - index:    0x6040
+//	    subindex: 0x00
+//	    bits:     16
+//	    name:     ctrl_word
 //
 // The name field maps this entry to a SlaveOffsets field in C.
 // Names starting with "_" are padding — registered with IgH to
@@ -71,15 +71,16 @@ type PDOEntry struct {
 // PDOSyncManager describes one EtherCAT sync manager and its entries.
 // Maps to one block in the YAML sync_managers list:
 //
-//   sync_managers:
-//     - sm:        2
-//       direction: output
-//       watchdog:  enable
-//       pdo_index: 0x1600
-//       entries:   [ ... ]
+//	sync_managers:
+//	  - sm:        2
+//	    direction: output
+//	    watchdog:  enable
+//	    pdo_index: 0x1600
+//	    entries:   [ ... ]
 //
 // direction: "output" = RxPDO (master→drive, SM2)
-//            "input"  = TxPDO (drive→master, SM3)
+//
+//	"input"  = TxPDO (drive→master, SM3)
 type PDOSyncManager struct {
 	SM        int        `yaml:"sm"`
 	Direction string     `yaml:"direction"`
@@ -98,15 +99,16 @@ type PDOSyncManager struct {
 // position control drives).
 //
 // WHY THIS MATTERS — Root cause of Error 80 during operation:
-//   The Panasonic A6 MINAS A6 (and most servo drives) require DC sync so
-//   the slave's internal SYNC0 events are locked to the EtherCAT master's
-//   reference clock. Without DC configuration, the slave runs in Free Run
-//   mode using its own oscillator. After 5-7 seconds the free-running timer
-//   drifts beyond the A6's internal tolerance → the drive raises Error 80
-//   "ESM unauthorized request error protection" and faults.
-//   The old drive-specific configure_minas_a6_pdos() called
-//   ecrt_slave_config_dc() — Phase 3 removed that function and did not
-//   migrate the DC call into the generic register_slave_pdos() path.
+//
+//	The Panasonic A6 MINAS A6 (and most servo drives) require DC sync so
+//	the slave's internal SYNC0 events are locked to the EtherCAT master's
+//	reference clock. Without DC configuration, the slave runs in Free Run
+//	mode using its own oscillator. After 5-7 seconds the free-running timer
+//	drifts beyond the A6's internal tolerance → the drive raises Error 80
+//	"ESM unauthorized request error protection" and faults.
+//	The old drive-specific configure_minas_a6_pdos() called
+//	ecrt_slave_config_dc() — Phase 3 removed that function and did not
+//	migrate the DC call into the generic register_slave_pdos() path.
 type PDOLayout struct {
 	DCAssignActivate uint16           `yaml:"dc_assign_activate"`
 	SyncManagers     []PDOSyncManager `yaml:"sync_managers"`
@@ -332,19 +334,21 @@ func SetupPDOPosition(dev *MasterDevice) error {
 // YAML, not in Go or C source code.
 //
 // Data flow:
-//   pdoLayoutMap[dev.Device.AddressConfigName]   (parsed from YAML at startup)
-//     → []PDOEntry (Go)
-//     → []C.PdoEntrySpec (C struct array built in Go)
-//     → register_slave_pdos() in ethercatinterface.c
-//     → ecrt_slave_config_pdos() + ecrt_domain_reg_pdo_entry_list()
-//     → SlaveOffsets[dev.Position] populated by IgH
-//     → get_slave_offsets() → dev.Off* fields + Pdo*Ready flags
+//
+//	pdoLayoutMap[dev.Device.AddressConfigName]   (parsed from YAML at startup)
+//	  → []PDOEntry (Go)
+//	  → []C.PdoEntrySpec (C struct array built in Go)
+//	  → register_slave_pdos() in ethercatinterface.c
+//	  → ecrt_slave_config_pdos() + ecrt_domain_reg_pdo_entry_list()
+//	  → SlaveOffsets[dev.Position] populated by IgH
+//	  → get_slave_offsets() → dev.Off* fields + Pdo*Ready flags
 //
 // After this returns, drive-specific SetupPDO() implementations do
 // any post-processing that cannot be expressed in YAML:
-//   A6Minas     — create_mt_sdo_requests, create_profile_vel_sdo_request,
-//                 pre-assert 0x60FE:02 ownership mask.
-//   DeltaASDA2E — nothing extra (pure generic path).
+//
+//	A6Minas     — create_mt_sdo_requests, create_profile_vel_sdo_request,
+//	              pre-assert 0x60FE:02 ownership mask.
+//	DeltaASDA2E — nothing extra (pure generic path).
 func setupPDOPositionGeneric(dev *MasterDevice) error {
 
 	// ── 1. Get YAML-parsed PDO layout ────────────────────────────────────
@@ -358,8 +362,8 @@ func setupPDOPositionGeneric(dev *MasterDevice) error {
 
 	rxEntries := layout.RxEntries()
 	txEntries := layout.TxEntries()
-	rxSM      := layout.RxSM()
-	txSM      := layout.TxSM()
+	rxSM := layout.RxSM()
+	txSM := layout.TxSM()
 
 	if len(rxEntries) == 0 || len(txEntries) == 0 {
 		return fmt.Errorf(
@@ -449,9 +453,9 @@ func setupPDOPositionGeneric(dev *MasterDevice) error {
 	// string into it byte-by-byte and null-terminate.
 	cRx := make([]C.PdoEntrySpec, len(rxEntries))
 	for i, e := range rxEntries {
-		cRx[i].index    = C.uint16_t(e.Index)
+		cRx[i].index = C.uint16_t(e.Index)
 		cRx[i].subindex = C.uint8_t(e.Subindex)
-		cRx[i].bits     = C.uint8_t(e.Bits)
+		cRx[i].bits = C.uint8_t(e.Bits)
 		nb := []byte(e.Name)
 		if len(nb) > 31 {
 			nb = nb[:31]
@@ -463,11 +467,22 @@ func setupPDOPositionGeneric(dev *MasterDevice) error {
 	}
 
 	cTx := make([]C.PdoEntrySpec, len(txEntries))
+	followingErrorMapped := false
 	for i, e := range txEntries {
-		cTx[i].index    = C.uint16_t(e.Index)
+		cTx[i].index = C.uint16_t(e.Index)
 		cTx[i].subindex = C.uint8_t(e.Subindex)
-		cTx[i].bits     = C.uint8_t(e.Bits)
-		nb := []byte(e.Name)
+		cTx[i].bits = C.uint8_t(e.Bits)
+		name := e.Name
+		// Promote the existing physical entry to a readable offset. This only
+		// changes registration metadata, never PDO indexes, order or widths.
+		if e.Index == 0x60F4 && e.Subindex == 0 {
+			if e.Bits != 32 || followingErrorMapped {
+				return fmt.Errorf("setupPDOPositionGeneric[%s]: require one 32-bit 0x60F4:00 entry", dev.Name)
+			}
+			name = "following_err"
+			followingErrorMapped = true
+		}
+		nb := []byte(name)
 		if len(nb) > 31 {
 			nb = nb[:31]
 		}
@@ -489,13 +504,13 @@ func setupPDOPositionGeneric(dev *MasterDevice) error {
 	rc := C.register_slave_pdos(
 		dev.Master,
 		domain,
-		sc,                                                          // FIX: pass the canonical sc, not alias/position/vendor/product
+		sc, // FIX: pass the canonical sc, not alias/position/vendor/product
 		C.int(dev.Position),
 		(*C.PdoEntrySpec)(unsafe.Pointer(&cRx[0])), C.int(len(cRx)),
 		(*C.PdoEntrySpec)(unsafe.Pointer(&cTx[0])), C.int(len(cTx)),
 		C.uint16_t(rxSM.PDOIndex),
 		C.uint16_t(txSM.PDOIndex),
-		C.ushort(dev.Device.Alias),                                  // still needed for registration table
+		C.ushort(dev.Device.Alias), // still needed for registration table
 		C.ushort(dev.Device.ID),
 		C.uint(dev.Device.VendorID),
 		C.uint(dev.Device.ProductCode),
@@ -520,15 +535,15 @@ func setupPDOPositionGeneric(dev *MasterDevice) error {
 	// A zero value means that object was not in the YAML pdo: section
 	// (either intentionally omitted or a padding entry). The cyclic
 	// task guards all reads/writes with the corresponding Pdo*Ready flag.
-	dev.OffControlWord   = offs.ctrl_word
-	dev.OffOpMode        = offs.op_mode
-	dev.OffTargetPos     = offs.target_pos
-	dev.OffTargetVel     = offs.target_vel
-	dev.OffDigOutMask    = offs.dig_out_mask
-	dev.OffDigOutVal     = offs.dig_out_val
-	dev.OffErrorCode     = offs.error_code
-	dev.OffStatus        = offs.status_word
-	dev.OffPos           = offs.actual_pos
+	dev.OffControlWord = offs.ctrl_word
+	dev.OffOpMode = offs.op_mode
+	dev.OffTargetPos = offs.target_pos
+	dev.OffTargetVel = offs.target_vel
+	dev.OffDigOutMask = offs.dig_out_mask
+	dev.OffDigOutVal = offs.dig_out_val
+	dev.OffErrorCode = offs.error_code
+	dev.OffStatus = offs.status_word
+	dev.OffPos = offs.actual_pos
 	dev.OffDigitalInputs = offs.digital_in
 	// FIX (Bug 3): Wire the four previously unmapped TxPDO fields.
 	// OffOpModeDisplay was declared in MasterDevice and read in the cyclic
@@ -537,6 +552,10 @@ func setupPDOPositionGeneric(dev *MasterDevice) error {
 	// The guard flag PdoOpModeDisplayReady was also never set, so the read
 	// was silently skipped. Both are now wired from the C SlaveOffsets struct.
 	dev.OffOpModeDisplay = offs.op_mode_disp
+	dev.OffFollowingError = offs.following_err
+	dev.PdoFollowingErrorReady = followingErrorMapped
+	logger.Info(fmt.Sprintf("[PDO] %s signed following error mapped=%t offset=%d (wire layout unchanged)",
+		dev.Name, followingErrorMapped, uint(offs.following_err)))
 
 	// ── 8. Set Pdo*Ready flags ────────────────────────────────────────────
 	//
@@ -546,18 +565,22 @@ func setupPDOPositionGeneric(dev *MasterDevice) error {
 
 	hasEntry := func(name string) bool {
 		for _, e := range rxEntries {
-			if e.Name == name { return true }
+			if e.Name == name {
+				return true
+			}
 		}
 		for _, e := range txEntries {
-			if e.Name == name { return true }
+			if e.Name == name {
+				return true
+			}
 		}
 		return false
 	}
 
-	dev.PdoReady       = hasEntry("actual_pos")
+	dev.PdoReady = hasEntry("actual_pos")
 	dev.PdoStatusReady = hasEntry("status_word")
-	dev.PdoErrorReady  = hasEntry("error_code")
-	dev.PdoDIReady     = hasEntry("digital_in")
+	dev.PdoErrorReady = hasEntry("error_code")
+	dev.PdoDIReady = hasEntry("digital_in")
 	dev.PdoDigOutReady = hasEntry("dig_out_val")
 	// FIX (Bug 3): Set PdoOpModeDisplayReady from YAML, not hardcoded false.
 	// When the drive YAML maps 0x6061 as "op_mode_disp", this flag becomes
@@ -571,7 +594,7 @@ func setupPDOPositionGeneric(dev *MasterDevice) error {
 		hasEntry("op_mode") &&
 		hasEntry("target_pos") &&
 		hasEntry("target_vel")
-		
+
 	dev.PdoJogReady = dev.PdoRxReady
 	dev.PdoPosReady = dev.PdoRxReady
 
