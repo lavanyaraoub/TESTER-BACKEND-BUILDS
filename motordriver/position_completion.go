@@ -12,8 +12,8 @@ const (
 	positionFeedbackMaxAge   = 50 * time.Millisecond
 	positionCompletionMaxGap = 20 * time.Millisecond
 	positionMoveTimeout      = 30 * time.Second
-	positionEndpointTimeout  = 2 * time.Second
-	positionEndpointMaxTime  = 4 * time.Second
+	positionEndpointTimeout  = 5 * time.Second
+	positionEndpointMaxTime  = 7 * time.Second
 )
 
 var errPositionSettleTimeout = errors.New("residual pulse alarm")

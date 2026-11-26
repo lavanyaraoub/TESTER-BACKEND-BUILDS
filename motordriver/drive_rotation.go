@@ -270,7 +270,7 @@ func waitForPositionCompletion(d *MasterDevice) (int32, int64, error) {
 			completion = &c
 			if record := d.ppLatchRecord.Load(); record != nil {
 				completion.armMotion(record.Actual, int64(record.Value))
-				logger.Info("[PP-LATCH] drive=", d.Name, " preparedReference=", record.PreparedReference,
+				logPDODiagnostic("[PP-LATCH] drive=", d.Name, " preparedReference=", record.PreparedReference,
 					" actualAtTrigger=", record.Actual, " wireDelta=", record.Value,
 					" expected=", record.Expected, " prepareTime=", record.Waited)
 			} else {
@@ -280,7 +280,7 @@ func waitForPositionCompletion(d *MasterDevice) (int32, int64, error) {
 		modeReady := !d.PdoOpModeDisplayReady || s.Mode == 1
 		done, err := completion.observe(s, now, modeReady, d.Driver.IsTargetReached(s.Status))
 		if !done && !completion.endpointDeadline.IsZero() && now.Sub(lastObserverReport) >= 250*time.Millisecond {
-			logger.Info("[PDO-PP OBSERVE] drive=", d.Name, " goal=", completion.goal,
+			logPDODiagnostic("[PDO-PP OBSERVE] drive=", d.Name, " goal=", completion.goal,
 				" actual=", s.Position, " signedResidual=", completion.residual(s),
 				" followingError=", s.FollowingError, " sw=", fmt.Sprintf("0x%04X", s.Status),
 				" sample=", s.Sequence, " ", completion.diagnostic())
@@ -294,7 +294,7 @@ func waitForPositionCompletion(d *MasterDevice) (int32, int64, error) {
 			return s.Position, r, err
 		}
 		if done {
-			logger.Info("[PDO-PP ENDPOINT] drive=", d.Name, " goal=", completion.goal,
+			logPDODiagnostic("[PDO-PP ENDPOINT] drive=", d.Name, " goal=", completion.goal,
 				" actual=", s.Position, " signedResidual=", completion.residual(s),
 				" followingError=", s.FollowingError, " followingMapped=", s.FollowingErrorReady,
 				" demand=", s.demand(completion.period), " sw=", fmt.Sprintf("0x%04X", s.Status),

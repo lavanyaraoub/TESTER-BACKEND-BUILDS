@@ -464,7 +464,7 @@ func StartPDOCyclic(devices []*MasterDevice) error {
 		runtime.LockOSThread()    // 1. Lock Go scheduler to this OS thread
 		C.set_realtime_priority() // 2. Tell Linux to give this thread Real-Time Priority
 		//runtime.LockOSThread()
-		logger.Info(fmt.Sprintf("[PDO] Cyclic task started — %d device(s), 1ms period", len(devices)))
+		logPDODiagnostic(fmt.Sprintf("[PDO] Cyclic task started — %d device(s), 1ms period", len(devices)))
 
 		ticker := time.NewTicker(1 * time.Millisecond)
 		defer ticker.Stop()
@@ -506,7 +506,7 @@ func StartPDOCyclic(devices []*MasterDevice) error {
 					if !d.PdoRxReady {
 						continue
 					}
-					logger.Info("[PDO] Shutdown: walking", d.Name, "to Ready To Switch On...")
+					logPDODiagnostic("[PDO] Shutdown: walking", d.Name, "to Ready To Switch On...")
 					// FIX (Bug 5): fresh deadline per device
 					devDeadline := time.Now().Add(2000 * time.Millisecond)
 					for time.Now().Before(devDeadline) {
@@ -522,7 +522,7 @@ func StartPDOCyclic(devices []*MasterDevice) error {
 						sw := uint16(C.read_u16(d.DomainPD, d.OffStatus))
 						C.ecrt_master_send(master)
 						if sw&0x006F == 0x0021 || sw&0x006F == 0x0040 {
-							logger.Info("[PDO] Shutdown: " + d.Name + " reached safe PDS state before master release")
+							logPDODiagnostic("[PDO] Shutdown: " + d.Name + " reached safe PDS state before master release")
 							break
 						}
 						time.Sleep(1 * time.Millisecond)
@@ -634,7 +634,7 @@ func StartPDOCyclic(devices []*MasterDevice) error {
 						if now-last > int64(500*time.Millisecond) {
 							d.PDODebugLog.Store(now)
 							shouldJogLog = true
-							logger.Info(fmt.Sprintf(
+							logPDODiagnostic(fmt.Sprintf(
 								"[PDO-DBG] %s status=0x%04X opEnabled=%v cw=0x%04X vel=%d pos=%d",
 								d.Name, status, opEnabled,
 								uint16(d.desiredControlWord.Load()&0xFFFF),
@@ -673,7 +673,7 @@ func StartPDOCyclic(devices []*MasterDevice) error {
 								if d.PdoOpModeDisplayReady {
 									activeModeStr = fmt.Sprintf("%d", d.PDOOpModeDisplay.Load())
 								}
-								logger.Info(fmt.Sprintf(
+								logPDODiagnostic(fmt.Sprintf(
 									"[PDO-JOG] %s actualCW=0x%04X cmdMode=%d activeMode=%s vel=%d pos=%d driver=%T",
 									d.Name, cwJog, op2, activeModeStr,
 									d.desiredTargetVelocity.Load(),
